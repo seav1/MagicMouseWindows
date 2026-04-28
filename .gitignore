@@ -1,0 +1,23 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.DotSettings.user
+
+## Build outputs
+publish/
+*.exe
+*.dll
+*.pdb
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Rider
+.idea/
+
+## VS Code
+.vscode/
