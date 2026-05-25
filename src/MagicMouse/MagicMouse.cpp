@@ -107,6 +107,12 @@ static int g_accX = 0;
 static int g_accY = 0;
 static wchar_t g_lastOpenPath[MAX_PATH] = L"";
 static wchar_t g_lastOpenDetail[4096] = L"";
+static volatile LONG g_reportCount = 0;
+static volatile LONG g_emitCount = 0;
+static int g_parserMode = 0; // 0=fixed [1,2], 1=adaptive delta
+static int g_parserY = 1;
+static int g_parserX = 2;
+static wchar_t g_lastReportHex[128] = L"";
 
 static BOOL IsServiceInstalled(const wchar_t* name);
 static AppState QueryState(int* outCandidates, int* outBound);
@@ -452,6 +458,11 @@ static DWORD WINAPI ReadThread(LPVOID arg)
     (void)arg;
     BYTE buf[64];
     DWORD read = 0;
+    BYTE prevRaw[64] = { 0 };
+    BYTE prevDelta[64] = { 0 };
+    BOOL havePrevDelta = FALSE;
+    int score[16] = { 0 };
+    int zeroFixedStreak = 0;
 
     while (g_running && g_dev) {
         if (!ReadFile(g_dev, buf, sizeof(buf), &read, NULL) || read < 3) {
@@ -465,8 +476,74 @@ static DWORD WINAPI ReadThread(LPVOID arg)
             continue;
         }
 
-        int dy = (signed char)buf[1];
-        int dx = (signed char)buf[2];
+        InterlockedIncrement(&g_reportCount);
+
+        // Keep a short hex snapshot in Status... for debugging.
+        int lim = (read > 8) ? 8 : (int)read;
+        wchar_t line[128] = L"";
+        for (int i = 0; i < lim; i++) {
+            wchar_t b[8];
+            StringCchPrintfW(b, _countof(b), L"%02X ", (unsigned)buf[i]);
+            StringCchCatW(line, _countof(line), b);
+        }
+        StringCchCopyW(g_lastReportHex, _countof(g_lastReportHex), line);
+
+        // Fixed parser (legacy layout): [1]=dy, [2]=dx.
+        int dyFixed = (signed char)buf[1];
+        int dxFixed = (signed char)buf[2];
+        int dy = dyFixed;
+        int dx = dxFixed;
+
+        // Learn adaptive indices if fixed parser keeps producing zeros.
+        int n = (read > 16) ? 16 : (int)read;
+        for (int i = 1; i < n; i++) {
+            int d = (int)(signed char)buf[i] - (int)(signed char)prevRaw[i];
+            if (d < 0) d = -d;
+            score[i] = score[i] - (score[i] / 16) + d; // leaky integrator
+            prevRaw[i] = buf[i];
+        }
+
+        if (dyFixed == 0 && dxFixed == 0) zeroFixedStreak++;
+        else zeroFixedStreak = 0;
+
+        if (zeroFixedStreak > 120 && n > 4) {
+            int best1 = -1, best2 = -1;
+            for (int i = 1; i < n; i++) {
+                if (best1 < 0 || score[i] > score[best1]) {
+                    best2 = best1;
+                    best1 = i;
+                } else if (best2 < 0 || score[i] > score[best2]) {
+                    best2 = i;
+                }
+            }
+            if (best1 > 0 && best2 > 0 && best1 != best2 && score[best1] > 20) {
+                g_parserMode = 1;
+                g_parserY = best1;
+                g_parserX = best2;
+                havePrevDelta = FALSE;
+            }
+        }
+
+        if (g_parserMode == 1) {
+            if (!havePrevDelta) {
+                for (int i = 0; i < 64; i++) prevDelta[i] = buf[i];
+                havePrevDelta = TRUE;
+                dy = 0;
+                dx = 0;
+            } else {
+                int iy = g_parserY, ix = g_parserX;
+                if (iy >= (int)read) iy = 1;
+                if (ix >= (int)read) ix = 2;
+                dy = (int)(signed char)buf[iy] - (int)(signed char)prevDelta[iy];
+                dx = (int)(signed char)buf[ix] - (int)(signed char)prevDelta[ix];
+                prevDelta[iy] = buf[iy];
+                prevDelta[ix] = buf[ix];
+            }
+        } else {
+            g_parserY = 1;
+            g_parserX = 2;
+        }
+
         if (g_s.natural) { dy = -dy; dx = -dx; }
 
         g_accY += dy * g_s.speed_x10;
@@ -478,7 +555,10 @@ static DWORD WINAPI ReadThread(LPVOID arg)
         if (ty) g_accY -= ty * step;
         if (tx) g_accX -= tx * step;
 
-        if (ty || tx) EmitWheel(ty, tx);
+        if (ty || tx) {
+            EmitWheel(ty, tx);
+            InterlockedIncrement(&g_emitCount);
+        }
     }
     return 0;
 }
@@ -497,6 +577,12 @@ static void StopReader(void)
         g_thread = NULL;
     }
     g_accX = g_accY = 0;
+    g_reportCount = 0;
+    g_emitCount = 0;
+    g_parserMode = 0;
+    g_parserY = 1;
+    g_parserX = 2;
+    g_lastReportHex[0] = 0;
 }
 
 static BOOL StartReader(void)
@@ -851,10 +937,17 @@ static void ShowStatus(void)
     wchar_t msg[4096];
     StringCchPrintfW(msg, _countof(msg),
         L"State: %s\r\nCandidates: %d\r\nBound count: %d\r\nLast open path: %s\r\n"
-        L"Open detail: %s\r\n\r\nTop candidates:\r\n%s",
+        L"Open detail: %s\r\n"
+        L"Parser: %s (y=%d, x=%d)\r\n"
+        L"Reports: %ld  Emits: %ld\r\n"
+        L"Last report[0..7]: %s\r\n\r\nTop candidates:\r\n%s",
         stateText, cands, bound,
         g_lastOpenPath[0] ? g_lastOpenPath : L"(none)",
         g_lastOpenDetail[0] ? g_lastOpenDetail : L"(none)",
+        g_parserMode == 0 ? L"fixed" : L"adaptive",
+        g_parserY, g_parserX,
+        g_reportCount, g_emitCount,
+        g_lastReportHex[0] ? g_lastReportHex : L"(none)",
         top[0] ? top : L"(none)");
     MessageBoxW(NULL, msg, L"Magic Mouse - Status", MB_OK | MB_ICONINFORMATION);
 }
