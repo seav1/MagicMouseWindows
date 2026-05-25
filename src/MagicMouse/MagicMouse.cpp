@@ -89,6 +89,7 @@ static wchar_t g_lastReport[128] = L"";
 static int g_parserMode = 0; // 0=fixed, 1=adaptive
 static int g_parserY = 1;
 static int g_parserX = 2;
+static int g_candidatePenalty[MAX_CANDIDATES] = { 0 };
 
 static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
 {
@@ -280,17 +281,23 @@ static BOOL OpenNextCandidate(int startIndex)
     if (g_candidates.count <= 0) return FALSE;
     if (startIndex < 0 || startIndex >= g_candidates.count) startIndex = 0;
 
-    for (int off = 0; off < g_candidates.count; off++) {
-        int i = (startIndex + off) % g_candidates.count;
-        DWORD err = 0;
-        HANDLE h = TryOpenPath(g_candidates.items[i].path, &err);
-        if (h) {
-            g_dev = h;
-            g_curCandidate = i;
-            StringCchCopyW(g_lastPath, _countof(g_lastPath), g_candidates.items[i].path);
-            return TRUE;
+    // Pass 1: prefer candidates without recent timeout penalties.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int off = 0; off < g_candidates.count; off++) {
+            int i = (startIndex + off) % g_candidates.count;
+            if (pass == 0 && g_candidatePenalty[i] > 0) continue;
+
+            DWORD err = 0;
+            HANDLE h = TryOpenPath(g_candidates.items[i].path, &err);
+            if (h) {
+                g_dev = h;
+                g_curCandidate = i;
+                StringCchCopyW(g_lastPath, _countof(g_lastPath), g_candidates.items[i].path);
+                if (g_candidatePenalty[i] > 0) g_candidatePenalty[i]--;
+                return TRUE;
+            }
+            InterlockedExchange(&g_lastErr, (LONG)err);
         }
-        InterlockedExchange(&g_lastErr, (LONG)err);
     }
     g_curCandidate = -1;
     g_lastPath[0] = 0;
@@ -360,8 +367,13 @@ static DWORD WINAPI ReadThread(LPVOID arg)
                     CancelIoEx(g_dev, &ov);
                     idleLoops++;
                     if (idleLoops > 32) { // ~8s no data
+                        if (g_curCandidate >= 0 && g_curCandidate < MAX_CANDIDATES) {
+                            if (g_candidatePenalty[g_curCandidate] < 3) g_candidatePenalty[g_curCandidate]++;
+                        }
+                        InterlockedExchange(&g_lastErr, (LONG)WAIT_TIMEOUT);
                         CloseHandle(g_dev);
                         g_dev = NULL;
+                        idleLoops = 0;
                     }
                     continue;
                 }
@@ -397,11 +409,12 @@ static DWORD WINAPI ReadThread(LPVOID arg)
             int bestA = -1, bestB = -1, magA = 0, magB = 0;
             int lim = read > 16 ? 16 : (int)read;
             for (int i = 1; i < lim; i++) {
-                int d = (int)(signed char)buf[i] - (int)(signed char)prev[i];
+                int old = (int)(signed char)prev[i];
+                int cur = (int)(signed char)buf[i];
+                int d = cur - old;
                 int ad = d < 0 ? -d : d;
                 if (ad > magA) { magB = magA; bestB = bestA; magA = ad; bestA = i; }
                 else if (ad > magB) { magB = ad; bestB = i; }
-                prev[i] = buf[i];
             }
             if (bestA > 0 && bestB > 0) {
                 g_parserMode = 1;
@@ -414,10 +427,13 @@ static DWORD WINAPI ReadThread(LPVOID arg)
                 g_parserY = 1;
                 g_parserX = 2;
             }
+            for (int i = 1; i < lim; i++) prev[i] = buf[i];
         } else {
             g_parserMode = 0;
             g_parserY = 1;
             g_parserX = 2;
+            int lim = read > 16 ? 16 : (int)read;
+            for (int i = 1; i < lim; i++) prev[i] = buf[i];
         }
 
         if (g_s.natural) { dy = -dy; dx = -dx; }
@@ -461,6 +477,7 @@ static void StopReader(void)
     g_parserMode = 0;
     g_parserY = 1;
     g_parserX = 2;
+    for (int i = 0; i < MAX_CANDIDATES; i++) g_candidatePenalty[i] = 0;
 }
 
 static BOOL StartReader(void)
@@ -493,8 +510,9 @@ static void ShowStatus(void)
         HANDLE h = TryOpenPath(g_candidates.items[i].path, &err);
         if (h) CloseHandle(h);
         StringCchPrintfW(line, _countof(line),
-            L"[%d] score=%d svc=%s err=%lu hwid=%s\r\n",
+            L"[%d] score=%d pen=%d svc=%s err=%lu hwid=%s\r\n",
             i, g_candidates.items[i].score,
+            g_candidatePenalty[i],
             g_candidates.items[i].service[0] ? g_candidates.items[i].service : L"(none)",
             err,
             g_candidates.items[i].hwid[0] ? g_candidates.items[i].hwid : L"(none)");
