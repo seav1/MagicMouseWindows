@@ -111,10 +111,18 @@ The `.exe` will be in `bin/Release/net6.0-windows/win-x64/publish/`
 **Scroll direction is wrong**
 - Open Settings → toggle **Natural Scroll**
 
-**App says "Magic Mouse not found"**
-- Confirm the device shows up in Device Manager under *Mice and other pointing devices* with the *MagicMouse* service driver attached
-- Pair the mouse via Bluetooth before launching the app
-- The app enumerates HID interfaces by Apple VID `05AC`. If your driver creates a non-HID raw PDO with a different name, file an issue with the device path so it can be added to the fallback list.
+**App says "Magic Mouse not found" or scroll doesn't work**
+
+Right-click the tray icon → **Diagnostics...** to see exactly which devices the app discovered:
+
+- Section `[1]` should list at least one candidate with `svc=MagicMouse` and a PDO path. If it's empty:
+  - Run `sc query MagicMouse` in PowerShell - it must show `STATE: 4 RUNNING`
+  - Re-pair the mouse via Bluetooth, then click **Reconnect** in the tray menu
+  - Re-run `pnputil /add-driver "C:\MagicMouseDriver\MagicMouse.inf" /install` and replug the mouse
+- Section `[2]` lists Apple HID devices. If [1] is empty but [2] has entries, the driver isn't bound to your specific hardware ID - you may need to manually update the driver in Device Manager and pick "MagicMouse" from the list.
+- Click **Copy to clipboard** and paste into a GitHub issue if you need help.
+
+**Also note**: with Magic Utilities installed, *their* app was the one generating scroll events. After you uninstall their app this app takes over, but Magic Utilities' driver service must still be running.
 
 ---
 
