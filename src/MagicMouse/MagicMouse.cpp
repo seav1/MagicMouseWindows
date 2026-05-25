@@ -51,6 +51,8 @@
 #define ID_M_RECONNECT     1004
 #define ID_M_DIAG          1005
 #define ID_M_AUTOSTART     1006
+#define ID_M_DEVMGR        1007
+#define ID_M_HELP_REBIND   1008
 #define ID_M_SPEED_BASE    2000   // menu id = 2000 + speed_x10
 
 static const int    kSpeedPresets[] = { 10, 20, 30, 50, 80, 100 };
@@ -176,21 +178,31 @@ static HANDLE TryOpenPath(const wchar_t* path)
     return (h == INVALID_HANDLE_VALUE) ? NULL : h;
 }
 
-// If openIt is FALSE we just walk the PnP tree and append a description of
-// every candidate to outDiag. If openIt is TRUE we additionally try to open
-// the first viable path and return the handle.
-static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
+// Helper: read a single SetupAPI property string.
+static BOOL ReadProp(HDEVINFO ds, SP_DEVINFO_DATA* d, DWORD prop,
+                    wchar_t* out, DWORD cb)
 {
-    if (outDiag && cchDiag)
-        StringCchCopyW(outDiag, cchDiag,
-            L"=== Magic Mouse device discovery ===\r\n");
+    out[0] = 0;
+    return SetupDiGetDeviceRegistryPropertyW(ds, d, prop, NULL,
+        (BYTE*)out, cb, NULL);
+}
+
+// Walks the PnP tree, finds devices whose driver service starts with
+// "MagicMouse*", and (optionally) opens the first viable raw PDO.
+//
+// outBoundCount receives the number of MagicMouse-service devices found.
+static HANDLE FindMagicMouseService(BOOL openIt,
+                                    wchar_t* outDiag, size_t cchDiag,
+                                    int* outBoundCount)
+{
+    if (outBoundCount) *outBoundCount = 0;
 
     HANDLE result = NULL;
     HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
         DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (ds == INVALID_HANDLE_VALUE) {
         if (outDiag) StringCchCatW(outDiag, cchDiag,
-            L"SetupDiGetClassDevs failed.\r\n");
+            L"  ! SetupDiGetClassDevs failed\r\n");
         return NULL;
     }
 
@@ -199,9 +211,7 @@ static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
 
     for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
         wchar_t svc[64] = { 0 };
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_SERVICE, NULL,
-                (BYTE*)svc, sizeof(svc), NULL))
-            continue;
+        if (!ReadProp(ds, &d, SPDRP_SERVICE, svc, sizeof(svc))) continue;
 
         BOOL isMagic = FALSE;
         for (int k = 0; kServices[k]; k++)
@@ -211,18 +221,21 @@ static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
         matches++;
 
         wchar_t pdo[260] = { 0 };
-        BOOL hasPdo = SetupDiGetDeviceRegistryPropertyW(ds, &d,
-            SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, NULL,
-            (BYTE*)pdo, sizeof(pdo), NULL);
+        BOOL hasPdo = ReadProp(ds, &d, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME,
+                                pdo, sizeof(pdo));
 
         if (outDiag) {
-            wchar_t line[400];
-            if (hasPdo)
-                StringCchPrintfW(line, 400,
-                    L"  [%d] svc=%s\r\n      pdo=%s\r\n", matches, svc, pdo);
-            else
-                StringCchPrintfW(line, 400,
-                    L"  [%d] svc=%s (no PDO name available)\r\n", matches, svc);
+            wchar_t desc[200] = { 0 };
+            if (!ReadProp(ds, &d, SPDRP_FRIENDLYNAME, desc, sizeof(desc)))
+                ReadProp(ds, &d, SPDRP_DEVICEDESC, desc, sizeof(desc));
+
+            wchar_t line[600];
+            StringCchPrintfW(line, 600,
+                L"  [%d] %s\r\n      service=%s\r\n      pdo=%s\r\n",
+                matches,
+                desc[0] ? desc : L"(no description)",
+                svc,
+                hasPdo ? pdo : L"(none)");
             StringCchCatW(outDiag, cchDiag, line);
         }
 
@@ -243,13 +256,11 @@ static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
     }
     SetupDiDestroyDeviceInfoList(ds);
 
-    if (outDiag && matches == 0) {
+    if (outBoundCount) *outBoundCount = matches;
+
+    if (outDiag && matches == 0)
         StringCchCatW(outDiag, cchDiag,
-            L"  No device with service=MagicMouse* found in PnP tree.\r\n"
-            L"  - Check the mouse is paired via Bluetooth.\r\n"
-            L"  - Run 'sc query MagicMouse' in PowerShell - state must be RUNNING.\r\n"
-            L"  - Reinstall driver: pnputil /add-driver MagicMouse.inf /install\r\n");
-    }
+            L"  (none found - the MagicMouse driver isn't bound to any device)\r\n");
 
     if (openIt && !result) {
         for (int i = 0; kFallbackPaths[i]; i++) {
@@ -268,6 +279,112 @@ static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
     }
 
     return result;
+}
+
+// Walks the PnP tree looking for ANY device whose hardware ID contains
+// "VID_05AC" (Apple, Inc.). For each, prints description + currently
+// bound driver service and manufacturer. This makes it obvious when
+// MagicMouse.sys is installed but Windows still uses its built-in HID
+// driver (e.g. service=HidUsb / mouhid) instead of MagicMouse.
+//
+// Returns: total Apple devices found via outFoundCount,
+//          how many of them are bound to MagicMouse via outBoundCount.
+static void EnumerateAppleDevices(wchar_t* outDiag, size_t cchDiag,
+                                  int* outFoundCount, int* outBoundCount)
+{
+    if (outFoundCount) *outFoundCount = 0;
+    if (outBoundCount) *outBoundCount = 0;
+
+    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
+        DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (ds == INVALID_HANDLE_VALUE) return;
+
+    SP_DEVINFO_DATA d = { sizeof(d) };
+    int matches = 0;
+
+    // SPDRP_HARDWAREID returns REG_MULTI_SZ - just check the buffer for the substring.
+    BYTE  hwidBuf[2048];
+
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
+        DWORD got = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
+                hwidBuf, sizeof(hwidBuf), &got) || got < 4)
+            continue;
+
+        // Treat as one wide string and look for "VID_05AC" anywhere.
+        wchar_t* p = (wchar_t*)hwidBuf;
+        DWORD count = got / sizeof(wchar_t);
+        BOOL apple = FALSE;
+        for (DWORD k = 0; k + 8 < count; k++) {
+            if ((p[k]   == L'V' || p[k]   == L'v') &&
+                (p[k+1] == L'I' || p[k+1] == L'i') &&
+                (p[k+2] == L'D' || p[k+2] == L'd') &&
+                 p[k+3] == L'_' &&
+                 p[k+4] == L'0' && p[k+5] == L'5' &&
+                (p[k+6] == L'A' || p[k+6] == L'a') &&
+                 p[k+7] == L'C')
+            { apple = TRUE; break; }
+        }
+        if (!apple) continue;
+
+        matches++;
+
+        // Hardware ID first string for display
+        wchar_t firstHwid[256] = { 0 };
+        StringCchCopyW(firstHwid, 256, (wchar_t*)hwidBuf);
+
+        wchar_t desc[200] = { 0 };
+        if (!ReadProp(ds, &d, SPDRP_FRIENDLYNAME, desc, sizeof(desc)))
+            ReadProp(ds, &d, SPDRP_DEVICEDESC, desc, sizeof(desc));
+
+        wchar_t svc[64] = L"(none)";
+        ReadProp(ds, &d, SPDRP_SERVICE, svc, sizeof(svc));
+
+        wchar_t mfg[128] = L"(unknown)";
+        ReadProp(ds, &d, SPDRP_MFG, mfg, sizeof(mfg));
+
+        BOOL boundToMagic = FALSE;
+        for (int k = 0; kServices[k]; k++)
+            if (_wcsicmp(svc, kServices[k]) == 0) { boundToMagic = TRUE; break; }
+        if (boundToMagic && outBoundCount) (*outBoundCount)++;
+
+        if (outDiag) {
+            wchar_t line[800];
+            // Truncate hardware ID for readability
+            if (wcslen(firstHwid) > 80) firstHwid[80] = 0;
+            StringCchPrintfW(line, 800,
+                L"  [%d] %s%s\r\n"
+                L"      hwid=%s%s\r\n"
+                L"      service=%s%s\r\n"
+                L"      manufacturer=%s\r\n",
+                matches,
+                desc[0] ? desc : L"(no description)",
+                boundToMagic ? L"  [bound to MagicMouse]" : L"  [NOT bound to MagicMouse]",
+                firstHwid, wcslen((wchar_t*)hwidBuf) > 80 ? L"..." : L"",
+                svc,
+                boundToMagic ? L"  <-- OK" : L"  <-- should be 'MagicMouse'!",
+                mfg);
+            StringCchCatW(outDiag, cchDiag, line);
+        }
+    }
+
+    SetupDiDestroyDeviceInfoList(ds);
+
+    if (outFoundCount) *outFoundCount = matches;
+
+    if (outDiag && matches == 0)
+        StringCchCatW(outDiag, cchDiag,
+            L"  (no Apple-VID devices present - is the mouse paired and on?)\r\n");
+}
+
+// Backwards-compatible wrapper used by the runtime open path.
+static HANDLE FindAndOpen(BOOL openIt, wchar_t* outDiag, size_t cchDiag)
+{
+    if (outDiag && cchDiag)
+        StringCchCopyW(outDiag, cchDiag,
+            L"=== Magic Mouse device discovery ===\r\n");
+    int n = 0;
+    return FindMagicMouseService(openIt, outDiag, cchDiag, &n);
 }
 
 // ===========================================================================
@@ -438,8 +555,10 @@ static void ShowTrayMenu(void)
     AppendMenuW(menu, MF_STRING | (g_s.horizontal ? MF_CHECKED : 0), ID_M_HORIZONTAL, L"Horizontal scroll");
     AppendMenuW(menu, MF_STRING | (g_s.autostart  ? MF_CHECKED : 0), ID_M_AUTOSTART,  L"Start with Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_M_RECONNECT, L"Reconnect");
-    AppendMenuW(menu, MF_STRING, ID_M_DIAG,      L"Diagnostics...");
+    AppendMenuW(menu, MF_STRING, ID_M_RECONNECT,    L"Reconnect");
+    AppendMenuW(menu, MF_STRING, ID_M_DIAG,         L"Diagnostics...");
+    AppendMenuW(menu, MF_STRING, ID_M_DEVMGR,       L"Open Device Manager");
+    AppendMenuW(menu, MF_STRING, ID_M_HELP_REBIND,  L"How to switch driver...");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_M_QUIT, L"Quit");
 
@@ -450,23 +569,110 @@ static void ShowTrayMenu(void)
 
 static void ShowDiagnostics(void)
 {
-    static wchar_t diag[16384];
-    FindAndOpen(FALSE, diag, _countof(diag));
+    static wchar_t diag[32768];
+    StringCchCopyW(diag, _countof(diag),
+        L"=== Magic Mouse - Diagnostics ===\r\n\r\n"
+        L"[1] PnP devices using the MagicMouse driver service:\r\n");
 
-    wchar_t tail[512];
-    StringCchPrintfW(tail, 512,
-        L"\r\n----\r\nCurrent state: %s\r\nOpened path:   %s\r\n"
-        L"Speed: %d.%dx   Natural: %s   Horizontal: %s\r\n",
+    int boundCount = 0;
+    FindMagicMouseService(FALSE, diag, _countof(diag), &boundCount);
+
+    StringCchCatW(diag, _countof(diag),
+        L"\r\n[2] PnP devices with Apple VID (0x05AC):\r\n");
+
+    int appleFound = 0, appleBound = 0;
+    EnumerateAppleDevices(diag, _countof(diag), &appleFound, &appleBound);
+
+    wchar_t tail[1024];
+    StringCchPrintfW(tail, 1024,
+        L"\r\n[3] Current state: %s\r\n"
+        L"    Opened path:   %s\r\n"
+        L"    Speed: %d.%dx   Natural: %s   Horizontal: %s\r\n",
         g_dev ? L"CONNECTED" : L"NOT CONNECTED",
         g_lastOpenPath[0] ? g_lastOpenPath : L"(none)",
         g_s.speed_x10 / 10, g_s.speed_x10 % 10,
         g_s.natural    ? L"on" : L"off",
         g_s.horizontal ? L"on" : L"off");
     StringCchCatW(diag, _countof(diag), tail);
+
+    // Smart conclusion
+    StringCchCatW(diag, _countof(diag), L"\r\n--- DIAGNOSIS ---\r\n");
+    if (g_dev) {
+        StringCchCatW(diag, _countof(diag),
+            L"App is connected to the MagicMouse driver. If scroll still doesn't\r\n"
+            L"work, the driver may need a wake-up: try the Reconnect menu item, or\r\n"
+            L"unpair and re-pair the mouse via Bluetooth.\r\n");
+    }
+    else if (boundCount == 0 && appleFound == 0) {
+        StringCchCatW(diag, _countof(diag),
+            L"No Apple device is currently present in PnP. Make sure the mouse\r\n"
+            L"is powered ON and PAIRED via Bluetooth, then click 'Reconnect'.\r\n");
+    }
+    else if (boundCount == 0 && appleFound > 0) {
+        StringCchCatW(diag, _countof(diag),
+            L"** The MagicMouse driver is installed but NOT bound to your mouse. **\r\n"
+            L"Windows is using its built-in HID driver (e.g. HidUsb / mouhid).\r\n"
+            L"You must manually switch the driver:\r\n"
+            L"\r\n"
+            L"  1. Click 'Open Device Manager' in this app's tray menu.\r\n"
+            L"  2. Expand 'Mice and other pointing devices' (and 'Bluetooth' if present).\r\n"
+            L"  3. Right-click your Magic Mouse -> Update driver.\r\n"
+            L"  4. 'Browse my computer for drivers'\r\n"
+            L"  5. 'Let me pick from a list of available drivers on my computer'.\r\n"
+            L"  6. UNCHECK 'Show compatible hardware'.\r\n"
+            L"  7. Manufacturer: 'Magic Utilities' or similar - select 'MagicMouse'.\r\n"
+            L"     If it isn't listed, click 'Have Disk...' and point to MagicMouse.inf.\r\n"
+            L"  8. Click Next, accept any unsigned-driver warning.\r\n"
+            L"  9. Come back here and click 'Reconnect'.\r\n");
+    }
+    else if (boundCount > 0 && !g_dev) {
+        StringCchCatW(diag, _countof(diag),
+            L"MagicMouse driver IS bound, but the raw PDO couldn't be opened.\r\n"
+            L"Try clicking 'Reconnect'. If that still fails, restart the\r\n"
+            L"MagicMouse service:\r\n"
+            L"  PowerShell (Admin):  Restart-Service MagicMouse\r\n");
+    }
+
     StringCchCatW(diag, _countof(diag),
-        L"\r\nTip: press Ctrl+C inside this dialog to copy the report.\r\n");
+        L"\r\nTip: press Ctrl+C inside this dialog to copy the full report.\r\n");
 
     MessageBoxW(NULL, diag, L"Magic Mouse - Diagnostics",
+        MB_OK | MB_ICONINFORMATION);
+}
+
+static void OpenDeviceManager(void)
+{
+    // devmgmt.msc is an MMC console; ShellExecute lets the system handle it.
+    ShellExecuteW(NULL, L"open", L"devmgmt.msc", NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void ShowRebindHelp(void)
+{
+    MessageBoxW(NULL,
+        L"How to bind the MagicMouse driver to your mouse:\r\n"
+        L"\r\n"
+        L"1. Open Device Manager (devmgmt.msc).\r\n"
+        L"2. Expand 'Mice and other pointing devices'.\r\n"
+        L"   (If your mouse appears under 'Bluetooth' or 'Human Interface\r\n"
+        L"   Devices' instead, look there.)\r\n"
+        L"3. Right-click your Magic Mouse -> Update driver.\r\n"
+        L"4. Choose 'Browse my computer for drivers'.\r\n"
+        L"5. Choose 'Let me pick from a list of available drivers on my\r\n"
+        L"   computer'.\r\n"
+        L"6. Untick 'Show compatible hardware' so all drivers are listed.\r\n"
+        L"7. In the Manufacturer column find 'Magic Utilities' (or similar);\r\n"
+        L"   in the Model column select 'MagicMouse'. If it isn't there,\r\n"
+        L"   click 'Have Disk...' and browse to your MagicMouse.inf file.\r\n"
+        L"8. Confirm Next, accept the unsigned-driver / digital-signature\r\n"
+        L"   warning if Windows shows one.\r\n"
+        L"9. The mouse may briefly disconnect; that's expected.\r\n"
+        L"10. Back in this app's tray menu, click 'Reconnect'.\r\n"
+        L"\r\n"
+        L"You can also re-run the driver installer from PowerShell:\r\n"
+        L"  pnputil /add-driver \"C:\\MagicMouseDriver\\MagicMouse.inf\" /install\r\n"
+        L"...and then unpair + re-pair the mouse via Bluetooth so PnP\r\n"
+        L"re-evaluates which driver to use.",
+        L"Magic Mouse - How to switch driver",
         MB_OK | MB_ICONINFORMATION);
 }
 
@@ -509,6 +715,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break;
                 case ID_M_DIAG:
                     ShowDiagnostics();
+                    break;
+                case ID_M_DEVMGR:
+                    OpenDeviceManager();
+                    break;
+                case ID_M_HELP_REBIND:
+                    ShowRebindHelp();
                     break;
                 case ID_M_QUIT:
                     StopReader();
