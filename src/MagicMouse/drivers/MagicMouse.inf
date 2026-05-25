@@ -1,0 +1,161 @@
+[Strings]
+Manufacturer="Apple Inc."
+Provider="Magic Utilities Pty Ltd"
+Website="https://magicutilities.net"
+Drv.Name="MagicMouse"
+Disk.Name="Magic Mouse Installation Disk"
+Service.Desc="Magic Mouse Service"
+MM1.Model="Magic Mouse 2009"
+MM1.Desc="Magic Mouse 2009 Bluetooth"
+MM1.DescBth="Magic Mouse 2009 - Bluetooth"
+MM2.Model="Magic Mouse 2015"
+MM2.Desc="Magic Mouse 2015 hybrid Bluetooth/USB"
+MM2.DescBth="Magic Mouse 2015 - Bluetooth"
+MM2.DescUsb=" Magic Mouse 2015 - Lightning > USB"
+MM2.DescAuxiliaryDevice="Magic Mouse 2015 - USB Auxiliary Device"
+MM3.Model="Magic Mouse 2024"
+MM3.Desc="Magic Mouse 2024 hybrid Bluetooth/USB"
+MM3.DescBth="Magic Mouse 2024 - Bluetooth"
+MM3.DescUsb=" Magic Mouse 2024 - USB-C"
+MM3.DescAuxiliaryDevice="Magic Mouse 2024 - USB Auxiliary Device"
+Desc.Suffix="multi-touch driver. (C) Magic Utilities Pty Ltd."
+KernelDriver=1
+DemandStart=3
+ErrorNormal=1
+[Service_Installation]
+DisplayName=%Service.Desc%
+ServiceType=%KernelDriver%
+StartType=%DemandStart%
+ErrorControl=%ErrorNormal%
+ServiceBinary=%12%\MagicMouse.sys
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGUID={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%Provider%
+DriverPackageDisplayName="Magic Mouse multi-touch"
+DriverPackageType=PlugAndPlay
+CatalogFile=MagicMouse.cat
+PnpLockDown=1
+DriverVer = 11/05/2024,3.1.5.3
+[SourceDisksNames]
+1=%Disk.Name%,,,""
+[SourceDisksFiles]
+MagicMouse.sys=1
+[DestinationDirs]
+DefaultDestDir=12
+[Manufacturer]
+%Manufacturer%=MagicUtilities,NTamd64
+[MagicUtilities.NTamd64]
+%MM1.DescBth%=MM1_BTH,BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d
+%MM1.DescBth%=MM1_BTH,BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310
+%MM2.DescBth%=MM2_BTH,BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269
+%MM2.DescUsb%=MM2_USB,USB\Vid_05ac&Pid_0269&MI_01
+%MM3.DescBth%=MM3_BTH,BTHENUM\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323
+%MM3.DescUsb%=MM3_USB,USB\Vid_05ac&Pid_0323&MI_01
+%MM2.DescAuxiliaryDevice%=MM_AuxiliaryDevices,USB\Vid_05ac&Pid_0269&MI_00
+%MM3.DescAuxiliaryDevice%=MM_AuxiliaryDevices,USB\Vid_05ac&Pid_0323&MI_00
+%MM2.DescAuxiliaryDevice%=MM_AuxiliaryDevices,USB\Vid_05ac&Pid_0269&MI_02
+[MM1_Properties]
+DeviceIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceBrandingIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceModel,,,,"Apple %MM1.Model%"
+DeviceVendorWebsite,,,,%Website%
+DeviceDetailedDescription,,,,"%MM1.Desc% %Desc.Suffix%"
+[MM2_Properties]
+DeviceIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceBrandingIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceModel,,,,"Apple %MM2.Model%"
+DeviceVendorWebsite,,,,%Website%
+DeviceDetailedDescription,,,,"%MM2.Desc% %Desc.Suffix%"
+[MM3_Properties]
+DeviceIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceBrandingIcon,,,,"%%SYSTEMROOT%%\system32\drivers\%Drv.Name%.sys,-101"
+DeviceModel,,,,"Apple %MM3.Model%"
+DeviceVendorWebsite,,,,%Website%
+DeviceDetailedDescription,,,,"%MM3.Desc% %Desc.Suffix%"
+[MM_AuxiliaryDevices]
+[MM_AuxiliaryDevices.Services]
+AddService=,2
+[Wdf_Version]
+KmdfLibraryVersion=1.15
+[MM_AddReg]
+HKR,,"SelectiveSuspendOn",0x00010001,0
+HKR,,"LowerFilters",0x00010000,"MagicMouse"
+[MM_Copy_Files]
+MagicMouse.sys
+[MM3_BTH.NT]  
+AddProperty=MM3_Properties
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT
+CopyFiles=MM_Copy_Files
+[MM3_BTH.NT.HW]
+AddReg=MM_AddReg
+Include=input.inf
+Needs=HID_Inst.NT.HW
+[MM3_BTH.NT.Services]
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT.Services
+AddService=MagicMouse,,Service_Installation
+[MM3_BTH.NT.Wdf]
+KmdfService=MagicMouse,Wdf_Version
+[MM3_USB.NT]  
+AddProperty=MM3_Properties
+Include=Input.inf
+Needs=HID_Inst.NT
+CopyFiles=MM_Copy_Files
+[MM3_USB.NT.HW]
+AddReg=MM_AddReg
+Include=input.inf
+Needs=HID_Inst.NT.HW
+[MM3_USB.NT.Services]
+Include=Input.inf
+Needs=HID_Inst.NT.Services
+AddService=MagicMouse,,Service_Installation
+[MM3_USB.NT.Wdf]
+KmdfService=MagicMouse,Wdf_Version
+[MM2_BTH.NT]  
+AddProperty=MM2_Properties
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT
+CopyFiles=MM_Copy_Files
+[MM2_BTH.NT.HW]
+AddReg=MM_AddReg
+Include=input.inf
+Needs=HID_Inst.NT.HW
+[MM2_BTH.NT.Services]
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT.Services
+AddService=MagicMouse,,Service_Installation
+[MM2_BTH.NT.Wdf]
+KmdfService=MagicMouse,Wdf_Version
+[MM2_USB.NT]  
+AddProperty=MM2_Properties
+Include=Input.inf
+Needs=HID_Inst.NT
+CopyFiles=MM_Copy_Files
+[MM2_USB.NT.HW]
+AddReg=MM_AddReg
+Include=input.inf
+Needs=HID_Inst.NT.HW
+[MM2_USB.NT.Services]
+Include=Input.inf
+Needs=HID_Inst.NT.Services
+AddService=MagicMouse,,Service_Installation
+[MM2_USB.NT.Wdf]
+KmdfService=MagicMouse,Wdf_Version
+[MM1_BTH.NT]  
+AddProperty=MM1_Properties
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT
+CopyFiles=MM_Copy_Files
+[MM1_BTH.NT.HW]
+AddReg=MM_AddReg
+Include=input.inf
+Needs=HID_Inst.NT.HW
+[MM1_BTH.NT.Services]
+Include=hidbth.inf
+Needs=HIDBTH_Inst.NT.Services
+AddService=MagicMouse,,Service_Installation
+[MM1_BTH.NT.Wdf]
+KmdfService=MagicMouse,Wdf_Version
