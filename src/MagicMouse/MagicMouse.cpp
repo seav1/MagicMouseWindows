@@ -109,6 +109,7 @@ static wchar_t g_lastOpenPath[MAX_PATH] = L"";
 
 static BOOL IsServiceInstalled(const wchar_t* name);
 static AppState QueryState(int* outCandidates, int* outBound);
+static HANDLE TryOpenPath(const wchar_t* path);
 
 static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
 {
@@ -163,6 +164,47 @@ static BOOL IsBoundByProps(HDEVINFO ds, SP_DEVINFO_DATA* d, wchar_t* outService,
         if (MultiSzContainsI(buf, got, L"MagicMouse")) return TRUE;
     }
     return FALSE;
+}
+
+// Enumerate all present devices whose SPDRP_SERVICE is exactly "MagicMouse".
+// This often discovers the real raw-report child node created by the driver,
+// which may not carry the parent mouse PID hardware IDs.
+static HANDLE OpenByMagicMouseService(int* outServiceCount)
+{
+    if (outServiceCount) *outServiceCount = 0;
+    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (ds == INVALID_HANDLE_VALUE) return NULL;
+
+    HANDLE opened = NULL;
+    SP_DEVINFO_DATA d = { sizeof(d) };
+    BYTE buf[4096];
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
+        DWORD got = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_SERVICE, NULL,
+                buf, sizeof(buf), &got) || got < sizeof(wchar_t) * 2) {
+            continue;
+        }
+        const wchar_t* svc = (const wchar_t*)buf;
+        if (_wcsicmp(svc, L"MagicMouse") != 0) continue;
+
+        if (outServiceCount) (*outServiceCount)++;
+        if (opened) continue;
+
+        wchar_t pdo[260] = L"";
+        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, NULL,
+                (BYTE*)pdo, sizeof(pdo), NULL) || !pdo[0]) {
+            continue;
+        }
+        wchar_t full[320];
+        StringCchPrintfW(full, _countof(full), L"\\\\.\\GLOBALROOT%s", pdo);
+        HANDLE h = TryOpenPath(full);
+        if (h) {
+            StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), full);
+            opened = h;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(ds);
+    return opened;
 }
 
 static int CollectCandidates(MouseCandidate* out, int cap)
@@ -233,6 +275,12 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
     if (outCandidateCount) *outCandidateCount = 0;
     g_lastOpenPath[0] = 0;
 
+    // Pass 0 (primary): direct service scan. This is the most reliable path.
+    int svcCount = 0;
+    HANDLE hSvc = OpenByMagicMouseService(&svcCount);
+    if (outBoundCount) *outBoundCount = svcCount;
+    if (hSvc) return hSvc;
+
     MouseCandidate arr[MAX_CANDIDATES];
     int n = CollectCandidates(arr, MAX_CANDIDATES);
     if (outCandidateCount) *outCandidateCount = n;
@@ -242,7 +290,7 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
     for (int i = 0; i < n; i++) {
         if (arr[i].isBound) boundCount++;
     }
-    if (outBoundCount) *outBoundCount = boundCount;
+    if (outBoundCount && *outBoundCount == 0) *outBoundCount = boundCount;
 
     // Pass 1: prefer bound devices.
     for (int i = 0; i < n; i++) {
