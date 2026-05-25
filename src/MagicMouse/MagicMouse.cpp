@@ -91,6 +91,17 @@ static const wchar_t* kMouseHwids[] = {
     NULL
 };
 
+// PID signatures for Magic Mouse generations seen in MagicMouse.inf.
+// We use PID matching instead of full-HWID exact matching because some
+// Windows stacks append extra suffixes/revisions to hardware IDs.
+static const wchar_t* kMousePidTokens[] = {
+    L"PID&0269", L"PID_0269",
+    L"PID&0323", L"PID_0323",
+    L"PID&030D", L"PID_030D",
+    L"PID&0310", L"PID_0310",
+    NULL
+};
+
 // ---------------------------------------------------------------------------
 // Settings (persisted to %APPDATA%\MagicMouse\config.ini)
 // ---------------------------------------------------------------------------
@@ -113,6 +124,16 @@ static HANDLE           g_thread = NULL;
 static volatile LONG    g_running = 0;
 static int              g_accX = 0, g_accY = 0;
 static wchar_t          g_lastOpenPath[MAX_PATH] = L"";
+
+// Forward declarations for helpers used before their definitions.
+static BOOL IsServiceInstalled(const wchar_t* name);
+
+typedef enum {
+    MM_STATE_CONNECTED = 0,
+    MM_STATE_DRIVER_MISMATCH = 1,  // mouse present but not bound to MagicMouse.sys
+    MM_STATE_NOT_PAIRED = 2,       // no present Magic Mouse device
+    MM_STATE_DRIVER_MISSING = 3    // service missing (first run / broken install)
+} MmState;
 
 // ===========================================================================
 // Settings persistence
@@ -220,10 +241,27 @@ static HANDLE OpenMagicMouse(int* outBound)
     return result;
 }
 
+static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
+{
+    if (!hay || !needle || !*needle) return FALSE;
+    size_t n = wcslen(needle);
+    for (const wchar_t* p = hay; *p; p++) {
+        if (_wcsnicmp(p, needle, n) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL IsMagicMouseHardwareId(const wchar_t* hwid)
+{
+    if (!hwid || !*hwid) return FALSE;
+    for (int i = 0; kMousePidTokens[i]; i++) {
+        if (ContainsI(hwid, kMousePidTokens[i])) return TRUE;
+    }
+    return FALSE;
+}
+
 // Returns TRUE if at least one currently-present device matches a hardware
-// ID listed in our INF (i.e. there is a Magic Mouse Windows might bind to).
-// We consult the device's full HardwareIDs list and require an exact match,
-// so e.g. a Magic Keyboard or AirPods will NEVER count as "a magic mouse".
+// ID whose PID matches known Magic Mouse generations.
 static BOOL IsAnyMagicMousePresent(void)
 {
     HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
@@ -240,14 +278,12 @@ static BOOL IsAnyMagicMousePresent(void)
             continue;
 
         // SPDRP_HARDWAREID returns a REG_MULTI_SZ - walk each NUL-terminated
-        // string and compare against our whitelist.
+        // string and match on known Magic Mouse PID signatures.
         const wchar_t* p = (const wchar_t*)buf;
         DWORD remain = got / sizeof(wchar_t);
         while (remain > 0 && *p) {
             size_t len = wcslen(p);
-            for (int k = 0; kMouseHwids[k] && !found; k++) {
-                if (_wcsicmp(p, kMouseHwids[k]) == 0) { found = TRUE; break; }
-            }
+            if (IsMagicMouseHardwareId(p)) { found = TRUE; break; }
             if (len + 1 > remain) break;
             p      += len + 1;
             remain -= (DWORD)(len + 1);
@@ -255,6 +291,59 @@ static BOOL IsAnyMagicMousePresent(void)
     }
     SetupDiDestroyDeviceInfoList(ds);
     return found;
+}
+
+static int CollectPresentMagicMouseHwids(
+    wchar_t out[][256], int outCap, wchar_t* sample, size_t sampleCch)
+{
+    if (sample && sampleCch) sample[0] = 0;
+    if (!out || outCap <= 0) return 0;
+    int count = 0;
+
+    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
+        DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (ds == INVALID_HANDLE_VALUE) return 0;
+
+    SP_DEVINFO_DATA d = { sizeof(d) };
+    BYTE buf[4096];
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
+        DWORD got = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
+                buf, sizeof(buf), &got) || got < 4)
+            continue;
+
+        const wchar_t* p = (const wchar_t*)buf;
+        DWORD remain = got / sizeof(wchar_t);
+        while (remain > 0 && *p) {
+            size_t len = wcslen(p);
+            if (IsMagicMouseHardwareId(p)) {
+                BOOL exists = FALSE;
+                for (int k = 0; k < count; k++) {
+                    if (_wcsicmp(out[k], p) == 0) { exists = TRUE; break; }
+                }
+                if (!exists && count < outCap) {
+                    StringCchCopyW(out[count], 256, p);
+                    count++;
+                    if (sample && sampleCch && !sample[0]) {
+                        StringCchCopyW(sample, sampleCch, p);
+                    }
+                }
+            }
+            if (len + 1 > remain) break;
+            p      += len + 1;
+            remain -= (DWORD)(len + 1);
+        }
+    }
+    SetupDiDestroyDeviceInfoList(ds);
+    return count;
+}
+
+static MmState QueryMouseState(void)
+{
+    if (g_dev) return MM_STATE_CONNECTED;
+    if (!IsServiceInstalled(L"MagicMouse")) return MM_STATE_DRIVER_MISSING;
+    if (IsAnyMagicMousePresent()) return MM_STATE_DRIVER_MISMATCH;
+    return MM_STATE_NOT_PAIRED;
 }
 
 // ===========================================================================
@@ -346,8 +435,13 @@ static BOOL StartReader(void)
 
 static void UpdateTrayTip(void)
 {
-    StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip),
-        g_dev ? L"Magic Mouse - connected" : L"Magic Mouse - not connected");
+    MmState s = QueryMouseState();
+    const wchar_t* tip = L"Magic Mouse - not connected";
+    if (s == MM_STATE_CONNECTED) tip = L"Magic Mouse - connected";
+    else if (s == MM_STATE_DRIVER_MISMATCH) tip = L"Magic Mouse - detected, driver is Microsoft";
+    else if (s == MM_STATE_NOT_PAIRED) tip = L"Magic Mouse - not paired";
+    else if (s == MM_STATE_DRIVER_MISSING) tip = L"Magic Mouse - driver not installed";
+    StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), tip);
     g_nid.uFlags |= NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
@@ -488,12 +582,26 @@ static int RunDriverInstallElevated(void)
         L"pnputil.exe /add-driver \"%s\" /install", infPath);
     DWORD rcAdd = RunWait(cmd);
 
-    // Step 2: per-hwid driver swap. Each call only touches devices whose
-    // hardware-ID list contains an exact match, so e.g. an Apple Magic
-    // Keyboard (different PID) will be left completely alone.
+    // Step 2: enumerate REAL currently-present Magic Mouse hardware IDs and
+    // update driver for those exact IDs. This is much more robust than using
+    // a hardcoded whitelist only, because the stack may append extra suffixes.
     int updated = 0;
     int triedHwid = 0;
     BOOL anyReboot = FALSE;
+    wchar_t hwids[32][256];
+    wchar_t sampleHwid[256] = L"";
+    int presentCount = CollectPresentMagicMouseHwids(hwids, 32, sampleHwid, _countof(sampleHwid));
+    for (int i = 0; i < presentCount; i++) {
+        triedHwid++;
+        BOOL reboot = FALSE;
+        if (UpdateDriverForPlugAndPlayDevicesW(NULL, hwids[i], infPath,
+                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &reboot)) {
+            updated++;
+            if (reboot) anyReboot = TRUE;
+        }
+    }
+    // Fallback for unplugged/unpaired-at-runtime cases: ask Windows with the
+    // canonical INF IDs as well, so future arrivals can bind without rerun.
     for (int i = 0; kMouseHwids[i]; i++) {
         triedHwid++;
         BOOL reboot = FALSE;
@@ -502,8 +610,6 @@ static int RunDriverInstallElevated(void)
             updated++;
             if (reboot) anyReboot = TRUE;
         }
-        // ERROR_NO_SUCH_DEVINST etc. just means "no matching device present
-        // right now"; that's fine - we just continue.
     }
 
     Sleep(800);
@@ -543,10 +649,12 @@ static int RunDriverInstallElevated(void)
 
     // Driver is in the store but UpdateDriverForPlugAndPlayDevicesW didn't
     // match anything (or matched but PnP hasn't finished re-binding yet).
-    wchar_t msg[1024];
+    wchar_t msg[1400];
     StringCchPrintfW(msg, _countof(msg),
         L"The Magic Mouse driver is registered, but no Magic Mouse is\r\n"
-        L"currently bound to it (devices updated: %d / %d hardware IDs).\r\n\r\n"
+        L"currently bound to it (updated calls: %d / %d).\r\n\r\n"
+        L"Detected Magic Mouse hardware IDs right now: %d\r\n"
+        L"Sample HWID: %s\r\n\r\n"
         L"What to try:\r\n\r\n"
         L"  1. Make sure the mouse is paired and turned on, then click\r\n"
         L"     \"Reconnect\" in the tray menu.\r\n"
@@ -556,7 +664,7 @@ static int RunDriverInstallElevated(void)
         L"  3. As a last resort, reboot Windows.\r\n\r\n"
         L"Other Bluetooth devices (keyboard, headphones, ...) are NOT\r\n"
         L"affected - this installer only touches the Magic Mouse PIDs.",
-        updated, triedHwid);
+        updated, triedHwid, presentCount, sampleHwid[0] ? sampleHwid : L"(none)");
     MessageBoxW(NULL, msg,
         L"Magic Mouse - Driver registered, no mouse bound",
         MB_OK | MB_ICONINFORMATION);
@@ -721,8 +829,13 @@ static void ShowTrayMenu(void)
         AppendMenuW(spd, f, ID_M_SPEED_BASE + kSpeedPresets[i], kSpeedNames[i]);
     }
 
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0,
-        g_dev ? L"Magic Mouse  [connected]" : L"Magic Mouse  [not connected]");
+    MmState st = QueryMouseState();
+    const wchar_t* title = L"Magic Mouse  [not connected]";
+    if (st == MM_STATE_CONNECTED) title = L"Magic Mouse  [connected]";
+    else if (st == MM_STATE_DRIVER_MISMATCH) title = L"Magic Mouse  [detected, Microsoft driver]";
+    else if (st == MM_STATE_NOT_PAIRED) title = L"Magic Mouse  [not paired]";
+    else if (st == MM_STATE_DRIVER_MISSING) title = L"Magic Mouse  [driver missing]";
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, title);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)spd, L"Scroll speed");
     AppendMenuW(menu, MF_STRING | (g_s.natural    ? MF_CHECKED : 0), ID_M_NATURAL,    L"Natural scroll");
