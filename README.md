@@ -1,47 +1,46 @@
-# 🖱 MagicMouseWindows
+# MagicMouseWindows
 
-**Free scroll & touch support for Apple Magic Mouse USB-C on Windows 10 and Windows 11**
+**Free scroll & touch support for Apple Magic Mouse on Windows 10 and Windows 11**
 
-> Works with Apple Magic Mouse (USB-C / A3204, 2024 model) — the newest model that no free driver previously supported.
+> Works with Apple Magic Mouse (USB-C / A3204, 2024 model) and older models.
+> Single ~150 KB native exe, no .NET runtime required.
 
 ![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows)
-![.NET 6](https://img.shields.io/badge/.NET-6.0-512BD4?logo=dotnet)
+![Native](https://img.shields.io/badge/Build-Win32%20native-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Free](https://img.shields.io/badge/Price-Free-brightgreen)
 
 ---
 
-## ✨ Features
+## Features
 
-- ✅ Vertical scroll
-- ✅ Horizontal scroll
-- ✅ Adjustable scroll speed
-- ✅ Natural scroll (macOS style) toggle
-- ✅ Acceleration control
-- ✅ Runs in system tray
-- ✅ Auto-reconnect on disconnect
-- ✅ Start with Windows option
-- ✅ Settings saved automatically
+- Vertical + horizontal scroll
+- Adjustable scroll speed (presets in tray menu)
+- Natural scroll (macOS style) toggle
+- Auto-reconnect on disconnect
+- Start with Windows option
+- Settings saved to `%APPDATA%\MagicMouse\config.ini`
+- Tray-only UI - no settings dialog clutter
 
 ---
 
-## 📋 Requirements
+## Requirements
 
 - Windows 10 (1607 / build 14393 or later) **or** Windows 11, x64
-- Apple Magic Mouse USB-C (A3204 / 2024 model). Older Magic Mouse / Magic Mouse 2 also enumerated.
-- Magic Utilities driver (free to extract — see setup below)
+- Apple Magic Mouse (USB-C A3204, Magic Mouse 2, original Magic Mouse all supported)
+- Magic Utilities driver `MagicMouse.sys` (free trial - see setup below)
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### Step 1 — Get the driver
+### Step 1 - Get the driver
 
-The app requires `MagicMouse.sys` from Magic Utilities. You only need the free trial — you don't need to pay.
+This app needs `MagicMouse.sys` from Magic Utilities. You only need their free trial - **the driver itself keeps working forever** even after you uninstall their app.
 
-1. Download **Magic Utilities** trial: https://magicutilities.net
-2. Install it (it installs the driver automatically)
-3. Copy the driver files to a safe location:
+1. Download Magic Utilities trial: https://magicutilities.net
+2. Install it (this installs the driver automatically)
+3. Save a copy of the driver files:
 
 ```powershell
 New-Item -Path "C:\MagicMouseDriver" -ItemType Directory -Force
@@ -57,95 +56,115 @@ Copy-Item "C:\Program Files\MagicUtilities\DriverMouse\MagicMouse.cat" "C:\Magic
 pnputil /add-driver "C:\MagicMouseDriver\MagicMouse.inf" /install
 ```
 
-### Step 2 — Download MagicMouseWindows
+6. Verify the driver service is running:
 
-Download the latest release from the [Releases page](https://github.com/kanishkkmalik/MagicMouseWindows/releases).
-
-Download `MagicMouseApp.exe` — no install needed, just run it.
-
-### Step 3 — Run
-
-Double-click `MagicMouseApp.exe`. It appears in your system tray.
-
-Double-click the tray icon to open settings.
-
----
-
-## ⚙️ Settings
-
-| Setting | Description |
-|---|---|
-| Scroll Speed | How fast the page scrolls (1x - 10x) |
-| Acceleration | Momentum multiplier |
-| Natural Scroll | Reverses scroll direction (macOS style) |
-| Horizontal Scroll | Enable/disable horizontal scrolling |
-| Start with Windows | Launch automatically on startup |
-
----
-
-## 🔧 Build from Source
-
-Requirements:
-- [.NET 6 SDK](https://dotnet.microsoft.com/download/dotnet/6.0)
-
-```bash
-git clone https://github.com/kanishkkmalik/MagicMouseWindows
-cd MagicMouseWindows/src/MagicMouseApp
-dotnet publish -c Release -r win-x64 --self-contained true
+```powershell
+sc query MagicMouse
 ```
 
-The `.exe` will be in `bin/Release/net6.0-windows/win-x64/publish/`
+It must show `STATE: 4 RUNNING`.
+
+### Step 2 - Download
+
+Download `MagicMouse.exe` from the [Releases page](https://github.com/seav1/MagicMouseWindows/releases).
+
+It's a single ~150 KB exe - no installer.
+
+### Step 3 - Run
+
+Double-click `MagicMouse.exe`. A small white-and-blue dot icon appears in the system tray.
+
+Right-click the tray icon to open the menu:
+
+```
+Magic Mouse  [connected]
+─────────────────────────
+Scroll speed              ▶  (1x / 2x / 3x / 5x / 8x / 10x)
+  Natural scroll
+  Horizontal scroll  ✓
+  Start with Windows
+─────────────────────────
+Reconnect
+Diagnostics...
+─────────────────────────
+Quit
+```
 
 ---
 
-## 🐛 Troubleshooting
+## Build from source
 
-**Scroll not working after launch**
-- Make sure the Magic Mouse is paired and connected via Bluetooth
-- Check that `MagicMouse.sys` is installed (run `sc query MagicMouse` in PowerShell)
-- Try closing and reopening the app
+### Native version (recommended) - `src/MagicMouse/`
 
-**Mouse disconnects**
-- This was a known issue with manual driver injection — the current version uses the proper Magic Utilities driver which is stable
+Requirements: Visual Studio Build Tools (free) with the **Desktop development with C++** workload.
 
-**Scroll direction is wrong**
-- Open Settings → toggle **Natural Scroll**
+```powershell
+cd src\MagicMouse
+.\build.cmd
+```
 
-**App says "Magic Mouse not found" or scroll doesn't work**
+Output: `src\MagicMouse\build\MagicMouse.exe` (~150 KB).
 
-Right-click the tray icon → **Diagnostics...** to see exactly which devices the app discovered:
+The `build.cmd` script auto-detects MSVC via `vswhere.exe`. If you're already inside a Developer Command Prompt it just uses that.
 
-- Section `[1]` should list at least one candidate with `svc=MagicMouse` and a PDO path. If it's empty:
-  - Run `sc query MagicMouse` in PowerShell - it must show `STATE: 4 RUNNING`
-  - Re-pair the mouse via Bluetooth, then click **Reconnect** in the tray menu
-  - Re-run `pnputil /add-driver "C:\MagicMouseDriver\MagicMouse.inf" /install` and replug the mouse
-- Section `[2]` lists Apple HID devices. If [1] is empty but [2] has entries, the driver isn't bound to your specific hardware ID - you may need to manually update the driver in Device Manager and pick "MagicMouse" from the list.
-- Click **Copy to clipboard** and paste into a GitHub issue if you need help.
+### Legacy .NET version - `src/MagicMouseApp/`
 
-**Also note**: with Magic Utilities installed, *their* app was the one generating scroll events. After you uninstall their app this app takes over, but Magic Utilities' driver service must still be running.
+The original .NET 6 / WinForms implementation is kept for reference. To build it:
 
----
+```powershell
+cd src\MagicMouseApp
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+```
 
-## 📝 How it works
-
-1. Magic Utilities' `MagicMouse.sys` driver is installed at the Bluetooth enumerator level
-2. It exposes a raw touch interface (`MAGICMOUSERAWPDO`)
-3. Our app opens this interface and reads raw touch reports
-4. Touch deltas are converted to standard Windows scroll wheel events via `SendInput`
-5. Works with any app that supports mouse wheel scrolling
+Output: ~60 MB self-contained exe under `bin\Release\net6.0-windows\win-x64\publish\`.
 
 ---
 
-## 🙏 Credits
+## Troubleshooting
 
-- Driver: [Magic Utilities](https://magicutilities.net) — their `MagicMouse.sys` kernel driver makes this possible
-- App: Built with C# / .NET 6 Windows Forms
-- Reverse engineered with help from Boot Camp driver analysis and HID report capture
+**Scroll doesn't work**
+
+Right-click the tray icon → **Diagnostics...**. The dialog shows every PnP device whose driver service starts with `MagicMouse`, plus the resolved kernel PDO path.
+
+- If the list is **empty**, the driver isn't bound to your mouse:
+  - Run `sc query MagicMouse` in PowerShell - state must be `RUNNING`
+  - Re-run `pnputil /add-driver "C:\MagicMouseDriver\MagicMouse.inf" /install`
+  - Re-pair the mouse via Bluetooth → click **Reconnect**
+- If the list **shows a device** but scroll still doesn't work, click **Reconnect**. Some Bluetooth stacks need the handle reopened after sleep/wake.
+- Press `Ctrl+C` inside the dialog to copy the entire report to clipboard, then attach to a GitHub issue.
+
+**Important**: while Magic Utilities was installed, **their userland app** was generating scroll events. After you uninstall it, this app takes over - but Magic Utilities' driver service (`MagicMouse`) must still be running.
+
+**Scroll direction wrong**
+
+Right-click tray → **Natural scroll** to toggle.
+
+**App seems to disappear**
+
+It's only in the tray. Right-click the tray icon to access it. To prevent Windows from auto-hiding the icon, drag it from the overflow flyout into the always-visible area.
 
 ---
 
-## 📄 License
+## How it works
+
+1. `MagicMouse.sys` from Magic Utilities is bound to the Bluetooth Magic Mouse at the enumerator level.
+2. It exposes a non-HID raw touch PDO whose kernel name (e.g. `\Device\00000416`) is assigned by PnP at install time. This number is **different on every machine**.
+3. The app calls `SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES)`, walks the PnP tree, finds devices whose `SPDRP_SERVICE` is `MagicMouse`, then reads `SPDRP_PHYSICAL_DEVICE_OBJECT_NAME` to get the dynamic PDO name.
+4. Opens it via `\\.\GLOBALROOT\Device\<pdo-name>` and runs a `ReadFile` loop on a worker thread.
+5. Each report's signed delta-X / delta-Y bytes are accumulated and emitted as `SendInput(MOUSEEVENTF_WHEEL / _HWHEEL)` events.
+
+---
+
+## Credits
+
+- Driver: [Magic Utilities](https://magicutilities.net) — their `MagicMouse.sys` kernel driver makes this possible.
+- Native rewrite: single-file C++ Win32 (no .NET, no MFC, no STL).
+- Reverse engineered via Boot Camp driver analysis and HID report capture.
+
+---
+
+## License
 
 MIT License — free to use, modify, and distribute.
 
-Note: `MagicMouse.sys` is proprietary to Magic Utilities and is not included in this repository. You must obtain it separately as described in the setup instructions.
+Note: `MagicMouse.sys` is proprietary to Magic Utilities and is **not** included in this repository. Obtain it separately via their free trial as described above.

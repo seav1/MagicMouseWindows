@@ -12,6 +12,16 @@ publish/
 *.dll
 *.pdb
 
+## C++ / MSVC native build
+build/
+*.obj
+*.res
+*.ilk
+*.exp
+*.lib
+*.idb
+*.tlog
+
 ## OS
 .DS_Store
 Thumbs.db
