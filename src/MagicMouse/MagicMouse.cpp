@@ -24,17 +24,17 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 
-#define WM_TRAY (WM_APP + 1)
+#define WM_TRAY      (WM_APP + 1)
 #define WM_RECONNECT (WM_APP + 2)
 
-#define ID_TRAY 1
-#define ID_M_SPEED_BASE 2000
-#define ID_M_NATURAL 1002
-#define ID_M_HORIZONTAL 1003
-#define ID_M_AUTOSTART 1005
-#define ID_M_RECONNECT 1004
-#define ID_M_STATUS 1007
-#define ID_M_QUIT 1001
+#define ID_TRAY            1
+#define ID_M_QUIT          1001
+#define ID_M_NATURAL       1002
+#define ID_M_HORIZONTAL    1003
+#define ID_M_RECONNECT     1004
+#define ID_M_AUTOSTART     1005
+#define ID_M_STATUS        1007
+#define ID_M_SPEED_BASE    2000
 
 #define MAX_CANDIDATES 64
 
@@ -53,14 +53,13 @@ typedef struct {
 } Candidate;
 
 typedef struct {
-    Candidate list[MAX_CANDIDATES];
+    Candidate items[MAX_CANDIDATES];
     int count;
-} CandidateSet;
+} CandidateList;
 
 static const int kSpeedPresets[] = { 10, 20, 30, 50, 80, 100 };
 static const wchar_t* kSpeedNames[] = {
-    L"1.0x  (slow)", L"2.0x", L"3.0x  (default)",
-    L"5.0x", L"8.0x", L"10.0x (fastest)"
+    L"1.0x  (slow)", L"2.0x", L"3.0x  (default)", L"5.0x", L"8.0x", L"10.0x (fastest)"
 };
 static const wchar_t* kPidTokens[] = {
     L"PID&0269", L"PID_0269",
@@ -73,23 +72,23 @@ static const wchar_t* kPidTokens[] = {
 static Settings g_s = { 30, FALSE, TRUE, FALSE };
 static HWND g_hwnd = NULL;
 static NOTIFYICONDATAW g_nid = { 0 };
-
 static HANDLE g_thread = NULL;
-static volatile LONG g_running = 0;
-
 static HANDLE g_dev = NULL;
+static volatile LONG g_running = 0;
 static int g_curCandidate = -1;
-static CandidateSet g_candidates;
+static CandidateList g_candidates;
 
 static int g_accX = 0;
 static int g_accY = 0;
-
 static volatile LONG g_reports = 0;
 static volatile LONG g_emits = 0;
 static volatile LONG g_timeouts = 0;
 static volatile LONG g_lastErr = 0;
 static wchar_t g_lastPath[320] = L"";
 static wchar_t g_lastReport[128] = L"";
+static int g_parserMode = 0; // 0=fixed, 1=adaptive
+static int g_parserY = 1;
+static int g_parserX = 2;
 
 static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
 {
@@ -149,8 +148,7 @@ static void ApplyAutostart(void)
 {
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-
+            0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
     if (g_s.autostart) {
         wchar_t exe[MAX_PATH], quoted[MAX_PATH + 4];
         GetModuleFileNameW(NULL, exe, _countof(exe));
@@ -163,19 +161,19 @@ static void ApplyAutostart(void)
     RegCloseKey(k);
 }
 
-static void CandidateSetAdd(CandidateSet* set, const wchar_t* path, const wchar_t* hwid, const wchar_t* service, int score)
+static void CandidateListAdd(CandidateList* list, const wchar_t* path, const wchar_t* hwid, const wchar_t* service, int score)
 {
-    if (!set || !path || !path[0]) return;
-    for (int i = 0; i < set->count; i++) {
-        if (_wcsicmp(set->list[i].path, path) == 0) {
-            if (score > set->list[i].score) set->list[i].score = score;
-            if (hwid && hwid[0] && !set->list[i].hwid[0]) StringCchCopyW(set->list[i].hwid, _countof(set->list[i].hwid), hwid);
-            if (service && service[0] && !set->list[i].service[0]) StringCchCopyW(set->list[i].service, _countof(set->list[i].service), service);
+    if (!list || !path || !path[0]) return;
+    for (int i = 0; i < list->count; i++) {
+        if (_wcsicmp(list->items[i].path, path) == 0) {
+            if (score > list->items[i].score) list->items[i].score = score;
+            if (hwid && hwid[0] && !list->items[i].hwid[0]) StringCchCopyW(list->items[i].hwid, _countof(list->items[i].hwid), hwid);
+            if (service && service[0] && !list->items[i].service[0]) StringCchCopyW(list->items[i].service, _countof(list->items[i].service), service);
             return;
         }
     }
-    if (set->count >= MAX_CANDIDATES) return;
-    Candidate* c = &set->list[set->count++];
+    if (list->count >= MAX_CANDIDATES) return;
+    Candidate* c = &list->items[list->count++];
     ZeroMemory(c, sizeof(*c));
     StringCchCopyW(c->path, _countof(c->path), path);
     if (hwid && hwid[0]) StringCchCopyW(c->hwid, _countof(c->hwid), hwid);
@@ -183,25 +181,22 @@ static void CandidateSetAdd(CandidateSet* set, const wchar_t* path, const wchar_
     c->score = score;
 }
 
-static void SortCandidates(CandidateSet* set)
+static void CandidateListSort(CandidateList* list)
 {
-    if (!set) return;
-    for (int i = 0; i < set->count; i++) {
-        for (int j = i + 1; j < set->count; j++) {
-            if (set->list[j].score > set->list[i].score) {
-                Candidate t = set->list[i];
-                set->list[i] = set->list[j];
-                set->list[j] = t;
+    for (int i = 0; i < list->count; i++) {
+        for (int j = i + 1; j < list->count; j++) {
+            if (list->items[j].score > list->items[i].score) {
+                Candidate t = list->items[i];
+                list->items[i] = list->items[j];
+                list->items[j] = t;
             }
         }
     }
 }
 
-static void RebuildCandidates(CandidateSet* out)
+static void RebuildCandidates(CandidateList* out)
 {
-    if (!out) return;
     ZeroMemory(out, sizeof(*out));
-
     HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (ds == INVALID_HANDLE_VALUE) return;
 
@@ -211,23 +206,23 @@ static void RebuildCandidates(CandidateSet* out)
     for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
         wchar_t pdo[260] = L"";
         if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, NULL,
-            (BYTE*)pdo, sizeof(pdo), NULL) || !pdo[0]) {
+                (BYTE*)pdo, sizeof(pdo), NULL) || !pdo[0]) {
             continue;
         }
         wchar_t path[320];
         StringCchPrintfW(path, _countof(path), L"\\\\.\\GLOBALROOT%s", pdo);
 
-        wchar_t service[128] = L"";
+        wchar_t svc[128] = L"";
         DWORD got = 0;
         if (SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_SERVICE, NULL, svcbuf, sizeof(svcbuf), &got) &&
             got >= sizeof(wchar_t) * 2) {
-            StringCchCopyW(service, _countof(service), (const wchar_t*)svcbuf);
+            StringCchCopyW(svc, _countof(svc), (const wchar_t*)svcbuf);
         }
 
-        int baseScore = 0;
-        if (_wcsicmp(service, L"MagicMouse") == 0) baseScore += 1000;
-        if (ContainsI(service, L"HidBth")) baseScore += 80;
-        if (ContainsI(service, L"mouhid")) baseScore -= 30;
+        int base = 0;
+        if (_wcsicmp(svc, L"MagicMouse") == 0) base += 1000;
+        if (ContainsI(svc, L"HidBth")) base += 60;
+        if (ContainsI(svc, L"mouhid")) base -= 30;
 
         got = 0;
         if (SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL, hwbuf, sizeof(hwbuf), &got) &&
@@ -237,31 +232,30 @@ static void RebuildCandidates(CandidateSet* out)
             while (remain > 0 && *p) {
                 size_t len = wcslen(p);
                 if (IsMagicMouseHwid(p)) {
-                    int score = baseScore + 200;
+                    int score = base + 200;
                     if (ContainsI(p, L"COL03")) score += 300;
                     else if (ContainsI(p, L"COL02")) score += 120;
                     else if (ContainsI(p, L"COL01")) score += 20;
-                    CandidateSetAdd(out, path, p, service, score);
+                    CandidateListAdd(out, path, p, svc, score);
                 }
                 if (len + 1 > remain) break;
                 p += len + 1;
                 remain -= (DWORD)(len + 1);
             }
-        } else if (_wcsicmp(service, L"MagicMouse") == 0) {
-            // Service-only node with no HWID visible is still very valuable.
-            CandidateSetAdd(out, path, L"", service, baseScore + 500);
+        } else if (_wcsicmp(svc, L"MagicMouse") == 0) {
+            CandidateListAdd(out, path, L"", svc, base + 500);
         }
     }
 
     SetupDiDestroyDeviceInfoList(ds);
-    SortCandidates(out);
+    CandidateListSort(out);
 }
 
-static HANDLE OpenCandidatePath(const wchar_t* path, DWORD* outErr)
+static HANDLE TryOpenPath(const wchar_t* path, DWORD* outErr)
 {
     if (outErr) *outErr = ERROR_SUCCESS;
-    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e1 = GetLastError();
         h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -274,20 +268,20 @@ static HANDLE OpenCandidatePath(const wchar_t* path, DWORD* outErr)
     return (h == INVALID_HANDLE_VALUE) ? NULL : h;
 }
 
-static BOOL OpenBestCandidate(int startIndex)
+static BOOL OpenNextCandidate(int startIndex)
 {
     if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
     if (g_candidates.count <= 0) return FALSE;
-
     if (startIndex < 0 || startIndex >= g_candidates.count) startIndex = 0;
-    for (int k = 0; k < g_candidates.count; k++) {
-        int i = (startIndex + k) % g_candidates.count;
+
+    for (int off = 0; off < g_candidates.count; off++) {
+        int i = (startIndex + off) % g_candidates.count;
         DWORD err = 0;
-        HANDLE h = OpenCandidatePath(g_candidates.list[i].path, &err);
+        HANDLE h = TryOpenPath(g_candidates.items[i].path, &err);
         if (h) {
             g_dev = h;
             g_curCandidate = i;
-            StringCchCopyW(g_lastPath, _countof(g_lastPath), g_candidates.list[i].path);
+            StringCchCopyW(g_lastPath, _countof(g_lastPath), g_candidates.items[i].path);
             return TRUE;
         }
         InterlockedExchange(&g_lastErr, (LONG)err);
@@ -316,7 +310,7 @@ static void EmitWheel(int tickY, int tickX)
     if (n) SendInput(n, in, sizeof(INPUT));
 }
 
-static void BuildReportPreview(const BYTE* buf, DWORD read)
+static void UpdateReportPreview(const BYTE* buf, DWORD read)
 {
     wchar_t line[128] = L"";
     int lim = read > 8 ? 8 : (int)read;
@@ -331,8 +325,7 @@ static void BuildReportPreview(const BYTE* buf, DWORD read)
 static DWORD WINAPI ReadThread(LPVOID arg)
 {
     (void)arg;
-    BYTE buf[64];
-    BYTE prev[64] = { 0 };
+    BYTE buf[64], prev[64] = { 0 };
     BOOL hasPrev = FALSE;
     OVERLAPPED ov = { 0 };
     ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -341,7 +334,7 @@ static DWORD WINAPI ReadThread(LPVOID arg)
     int idleLoops = 0;
     while (g_running) {
         if (!g_dev) {
-            if (!OpenBestCandidate(g_curCandidate + 1)) {
+            if (!OpenNextCandidate(g_curCandidate + 1)) {
                 Sleep(500);
                 continue;
             }
@@ -360,36 +353,35 @@ static DWORD WINAPI ReadThread(LPVOID arg)
                     InterlockedIncrement(&g_timeouts);
                     CancelIoEx(g_dev, &ov);
                     idleLoops++;
-                    // No reports for ~8s on this node -> rotate next candidate.
-                    if (idleLoops > 32) {
-                        if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
-                        continue;
+                    if (idleLoops > 32) { // ~8s no data on this node
+                        CloseHandle(g_dev);
+                        g_dev = NULL;
                     }
                     continue;
                 }
                 if (wr != WAIT_OBJECT_0 || !GetOverlappedResult(g_dev, &ov, &read, FALSE)) {
                     InterlockedExchange(&g_lastErr, (LONG)GetLastError());
-                    if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
+                    CloseHandle(g_dev);
+                    g_dev = NULL;
                     continue;
                 }
-                ok = TRUE;
             } else {
                 InterlockedExchange(&g_lastErr, (LONG)e);
-                if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
+                CloseHandle(g_dev);
+                g_dev = NULL;
                 continue;
             }
         }
-        if (!ok || read < 3) continue;
+        if (read < 3) continue;
 
         idleLoops = 0;
         InterlockedIncrement(&g_reports);
-        BuildReportPreview(buf, read);
+        UpdateReportPreview(buf, read);
 
-        // 1) Fixed parser first.
         int dy = (signed char)buf[1];
         int dx = (signed char)buf[2];
 
-        // 2) If fixed gives no movement, try adaptive diff on first active bytes.
+        // Adaptive fallback if fixed parser seems dead.
         if (dy == 0 && dx == 0) {
             if (!hasPrev) {
                 for (int i = 0; i < 64; i++) prev[i] = buf[i];
@@ -406,9 +398,20 @@ static DWORD WINAPI ReadThread(LPVOID arg)
                 prev[i] = buf[i];
             }
             if (bestA > 0 && bestB > 0) {
+                g_parserMode = 1;
+                g_parserY = bestA;
+                g_parserX = bestB;
                 dy = (int)(signed char)buf[bestA] - (int)(signed char)prev[bestA];
                 dx = (int)(signed char)buf[bestB] - (int)(signed char)prev[bestB];
+            } else {
+                g_parserMode = 0;
+                g_parserY = 1;
+                g_parserX = 2;
             }
+        } else {
+            g_parserMode = 0;
+            g_parserY = 1;
+            g_parserX = 2;
         }
 
         if (g_s.natural) { dy = -dy; dx = -dx; }
@@ -445,10 +448,15 @@ static void StopReader(void)
     }
     g_curCandidate = -1;
     g_accX = g_accY = 0;
-    g_reports = g_emits = g_timeouts = 0;
+    g_reports = 0;
+    g_emits = 0;
+    g_timeouts = 0;
     g_lastErr = 0;
     g_lastPath[0] = 0;
     g_lastReport[0] = 0;
+    g_parserMode = 0;
+    g_parserY = 1;
+    g_parserX = 2;
 }
 
 static BOOL StartReader(void)
@@ -464,42 +472,43 @@ static void UpdateTrayTip(void)
 {
     const wchar_t* tip = L"Magic Mouse - not found";
     if (g_dev) tip = L"Magic Mouse - connected";
-    else if (g_candidates.count > 0) tip = L"Magic Mouse - detected, no report stream";
-    g_nid.uFlags |= NIF_TIP;
+    else if (g_candidates.count > 0) tip = L"Magic Mouse - detected, switching nodes";
     StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), tip);
+    g_nid.uFlags |= NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 static void ShowStatus(void)
 {
     RebuildCandidates(&g_candidates);
-
     wchar_t top[2600] = L"";
     int lim = g_candidates.count > 6 ? 6 : g_candidates.count;
     for (int i = 0; i < lim; i++) {
         wchar_t ln[420];
         DWORD err = 0;
-        HANDLE h = OpenCandidatePath(g_candidates.list[i].path, &err);
+        HANDLE h = TryOpenPath(g_candidates.items[i].path, &err);
         if (h) CloseHandle(h);
         StringCchPrintfW(ln, _countof(ln),
             L"[%d] score=%d svc=%s err=%lu hwid=%s\r\n",
-            i, g_candidates.list[i].score,
-            g_candidates.list[i].service[0] ? g_candidates.list[i].service : L"(none)",
+            i, g_candidates.items[i].score,
+            g_candidates.items[i].service[0] ? g_candidates.items[i].service : L"(none)",
             err,
-            g_candidates.list[i].hwid[0] ? g_candidates.list[i].hwid : L"(none)");
+            g_candidates.items[i].hwid[0] ? g_candidates.items[i].hwid : L"(none)");
         StringCchCatW(top, _countof(top), ln);
     }
 
     wchar_t msg[4096];
     StringCchPrintfW(msg, _countof(msg),
-        L"Candidates: %d\r\nCurrent index: %d\r\nCurrent path: %s\r\n\r\n"
+        L"Candidates: %d\r\nCurrent index: %d\r\nCurrent path: %s\r\n"
+        L"Parser: %s (y=%d, x=%d)\r\n\r\n"
         L"Reports: %ld  Emits: %ld  Timeouts: %ld\r\n"
         L"LastErr: %ld\r\nLastReport[0..7]: %s\r\n\r\n"
         L"Top candidates:\r\n%s",
         g_candidates.count, g_curCandidate,
         g_lastPath[0] ? g_lastPath : L"(none)",
-        g_reports, g_emits, g_timeouts,
-        g_lastErr, g_lastReport[0] ? g_lastReport : L"(none)",
+        g_parserMode ? L"adaptive" : L"fixed", g_parserY, g_parserX,
+        g_reports, g_emits, g_timeouts, g_lastErr,
+        g_lastReport[0] ? g_lastReport : L"(none)",
         top[0] ? top : L"(none)");
     MessageBoxW(NULL, msg, L"Magic Mouse - Status", MB_OK | MB_ICONINFORMATION);
 }
@@ -536,17 +545,16 @@ static HICON CreateTrayIcon(void)
     ii.fIcon = TRUE;
     ii.hbmMask = mask;
     ii.hbmColor = color;
-    HICON icon = CreateIconIndirect(&ii);
+    HICON ico = CreateIconIndirect(&ii);
     DeleteObject(mask);
     DeleteObject(color);
-    return icon ? icon : LoadIconW(NULL, IDI_APPLICATION);
+    return ico ? ico : LoadIconW(NULL, IDI_APPLICATION);
 }
 
 static void ShowTrayMenu(void)
 {
     POINT pt;
     GetCursorPos(&pt);
-
     HMENU m = CreatePopupMenu();
     HMENU speed = CreatePopupMenu();
 
@@ -558,7 +566,6 @@ static void ShowTrayMenu(void)
 
     const wchar_t* title = g_dev ? L"Magic Mouse [connected]" :
         (g_candidates.count > 0 ? L"Magic Mouse [detected]" : L"Magic Mouse [not found]");
-
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, title);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)speed, L"Scroll speed");
@@ -580,7 +587,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_TRAY:
-        if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP) ShowTrayMenu();
+        if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_RBUTTONUP) ShowTrayMenu();
         return 0;
     case WM_RECONNECT:
         StartReader();
@@ -638,7 +645,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmd, int show)
     wc.lpszClassName = L"MagicMouseTrayWnd";
     RegisterClassW(&wc);
 
-    g_hwnd = CreateWindowW(L"MagicMouseTrayWnd", L"MagicMouse", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
+    g_hwnd = CreateWindowW(L"MagicMouseTrayWnd", L"MagicMouse",
+        0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
