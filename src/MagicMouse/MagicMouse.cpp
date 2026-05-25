@@ -323,6 +323,52 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
         }
     }
 
+    // Pass 2: some systems expose the usable report stream on a HID collection
+    // node (often Col03) that is not marked "bound" by our service/filter check.
+    // Pick the best openable candidate by score instead of giving up.
+    int bestIdx = -1;
+    int bestScore = -1;
+    HANDLE bestHandle = NULL;
+    DWORD bestErr = ERROR_GEN_FAILURE;
+    for (int i = 0; i < n; i++) {
+        if (!arr[i].hasPdo) continue;
+
+        DWORD err = 0;
+        HANDLE h = TryOpenPath(arr[i].pdoPath, &err);
+        if (!h) {
+            bestErr = err;
+            continue;
+        }
+
+        int score = 0;
+        if (arr[i].isBound) score += 20;
+        if (ContainsI(arr[i].sampleHwid, L"COL03")) score += 100;  // most likely touch collection
+        if (ContainsI(arr[i].sampleHwid, L"COL02")) score += 40;
+        if (ContainsI(arr[i].sampleHwid, L"HID\\")) score += 10;
+        if (ContainsI(arr[i].service, L"mouhid")) score -= 10;
+
+        if (score > bestScore) {
+            if (bestHandle) CloseHandle(bestHandle);
+            bestHandle = h;
+            bestScore = score;
+            bestIdx = i;
+        } else {
+            CloseHandle(h);
+        }
+    }
+    if (bestHandle) {
+        StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), arr[bestIdx].pdoPath);
+        StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+            L"fallback open ok: candidate[%d], score=%d, hwid=%s",
+            bestIdx, bestScore,
+            arr[bestIdx].sampleHwid[0] ? arr[bestIdx].sampleHwid : L"(none)");
+        return bestHandle;
+    }
+    if (!g_lastOpenDetail[0]) {
+        StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+            L"all candidate opens failed (last err=%lu)", bestErr);
+    }
+
     return NULL;
 }
 
