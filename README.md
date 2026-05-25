@@ -1,10 +1,10 @@
 # 🖱 MagicMouseWindows
 
-**Free scroll & touch support for Apple Magic Mouse USB-C on Windows 11**
+**Free scroll & touch support for Apple Magic Mouse USB-C on Windows 10 and Windows 11**
 
 > Works with Apple Magic Mouse (USB-C / A3204, 2024 model) — the newest model that no free driver previously supported.
 
-![Windows 11](https://img.shields.io/badge/Windows-11-0078D4?logo=windows)
+![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows)
 ![.NET 6](https://img.shields.io/badge/.NET-6.0-512BD4?logo=dotnet)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Free](https://img.shields.io/badge/Price-Free-brightgreen)
@@ -27,8 +27,8 @@
 
 ## 📋 Requirements
 
-- Windows 11 (x64)
-- Apple Magic Mouse USB-C (A3204 / 2024 model)
+- Windows 10 (1607 / build 14393 or later) **or** Windows 11, x64
+- Apple Magic Mouse USB-C (A3204 / 2024 model). Older Magic Mouse / Magic Mouse 2 also enumerated.
 - Magic Utilities driver (free to extract — see setup below)
 
 ---
@@ -110,6 +110,11 @@ The `.exe` will be in `bin/Release/net6.0-windows/win-x64/publish/`
 
 **Scroll direction is wrong**
 - Open Settings → toggle **Natural Scroll**
+
+**App says "Magic Mouse not found"**
+- Confirm the device shows up in Device Manager under *Mice and other pointing devices* with the *MagicMouse* service driver attached
+- Pair the mouse via Bluetooth before launching the app
+- The app enumerates HID interfaces by Apple VID `05AC`. If your driver creates a non-HID raw PDO with a different name, file an issue with the device path so it can be added to the fallback list.
 
 ---
 
