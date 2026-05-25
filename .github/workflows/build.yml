@@ -6,42 +6,45 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v3
-      with:
-        dotnet-version: '6.0.x'
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
 
-    - name: Restore dependencies
-      run: dotnet restore src/MagicMouseApp/MagicMouseApp.csproj
+      - name: Restore dependencies
+        run: dotnet restore src/MagicMouseApp/MagicMouseApp.csproj
 
-    - name: Build
-      run: dotnet publish src/MagicMouseApp/MagicMouseApp.csproj -c Release -r win-x64 --self-contained true -o publish
+      - name: Build
+        run: dotnet publish src/MagicMouseApp/MagicMouseApp.csproj -c Release -r win-x64 --self-contained true -o publish
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: MagicMouseApp
-        path: publish/MagicMouseApp.exe
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagicMouseApp
+          path: publish/MagicMouseApp.exe
 
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: publish/MagicMouseApp.exe
-        body: |
-          ## Magic Mouse Windows ${{ github.ref_name }}
-          
-          ### Installation
-          See [README](https://github.com/kanishkkmalik/MagicMouseWindows#-quick-start) for full setup instructions.
-          
-          ### Download
-          Download `MagicMouseApp.exe` below and run it directly — no installation needed.
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: publish/MagicMouseApp.exe
+          body: |
+            ## Magic Mouse Windows ${{ github.ref_name }}
+
+            ### Installation
+            See [README](https://github.com/seav1/MagicMouseWindows#-quick-start) for full setup instructions.
+
+            ### Download
+            Download `MagicMouseApp.exe` below and run it directly — no installation needed.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
