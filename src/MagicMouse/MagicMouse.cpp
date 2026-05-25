@@ -1,25 +1,3 @@
-// ============================================================================
-// MagicMouse.cpp - single-file Win32 implementation (no .NET, no MFC, no STL)
-//
-// What it does
-//   1. On first run (or when the driver isn't bound to your mouse) it offers
-//      to extract the embedded MagicMouse.sys / .inf / .cat to %TEMP%, relaunch
-//      itself elevated, run pnputil to install + rebind, and resume.
-//   2. Walks the PnP tree to find the device whose driver service is
-//      "MagicMouse" (Magic Utilities' kernel driver), opens its raw PDO via
-//      "\\.\GLOBALROOT\Device\<pdo-name>", and reads touch reports.
-//   3. Translates X/Y deltas into standard mouse-wheel events using SendInput.
-//   4. Lives in the system tray with a right-click menu.
-//
-// Build:
-//   cl /O2 /MT /EHsc /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 \
-//      MagicMouse.cpp MagicMouse.res \
-//      /link /SUBSYSTEM:WINDOWS /OUT:MagicMouse.exe \
-//      setupapi.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib
-//
-// Resulting exe is ~6.5 MB (driver embedded), runs on Windows 8.1 / 10 / 11.
-// ============================================================================
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -48,9 +26,6 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 #define WM_TRAY        (WM_APP + 1)
 #define WM_DEVICE_LOST (WM_APP + 2)
 
@@ -61,50 +36,17 @@
 #define ID_M_RECONNECT     1004
 #define ID_M_AUTOSTART     1005
 #define ID_M_REINSTALL     1006
-#define ID_M_SPEED_BASE    2000  // menu id = 2000 + speed_x10
+#define ID_M_STATUS        1007
+#define ID_M_SPEED_BASE    2000
 
-// Embedded driver resource IDs (must match MagicMouse.rc)
 #define RES_DRV_INF  100
 #define RES_DRV_SYS  101
 #define RES_DRV_CAT  102
 
-// Hidden command-line flag used when the app relaunches itself elevated.
 #define ARG_INSTALL_DRIVER L"--install-driver"
 
-static const int     kSpeedPresets[] = { 10, 20, 30, 50, 80, 100 };
-static const wchar_t* kSpeedNames[]  = {
-    L"1.0x  (slow)", L"2.0x", L"3.0x  (default)",
-    L"5.0x", L"8.0x", L"10.0x (fastest)"
-};
+#define MAX_CANDIDATES 64
 
-// Exact hardware IDs listed in MagicMouse.inf [MagicUtilities.NTamd64].
-// We feed every entry to UpdateDriverForPlugAndPlayDevicesW, which finds
-// matching devices and atomically switches their driver to MagicMouse.sys
-// without disturbing any other Bluetooth/USB device.
-static const wchar_t* kMouseHwids[] = {
-    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d", // Magic Mouse 2009 BT
-    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310", // Magic Mouse 2009 BT (alt)
-    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269", // Magic Mouse 2 (2015) BT
-    L"USB\\Vid_05ac&Pid_0269&MI_01",                                          // Magic Mouse 2 (2015) USB
-    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323", // Magic Mouse 3 (2024) BT
-    L"USB\\Vid_05ac&Pid_0323&MI_01",                                          // Magic Mouse 3 (2024) USB
-    NULL
-};
-
-// PID signatures for Magic Mouse generations seen in MagicMouse.inf.
-// We use PID matching instead of full-HWID exact matching because some
-// Windows stacks append extra suffixes/revisions to hardware IDs.
-static const wchar_t* kMousePidTokens[] = {
-    L"PID&0269", L"PID_0269",
-    L"PID&0323", L"PID_0323",
-    L"PID&030D", L"PID_030D",
-    L"PID&0310", L"PID_0310",
-    NULL
-};
-
-// ---------------------------------------------------------------------------
-// Settings (persisted to %APPDATA%\MagicMouse\config.ini)
-// ---------------------------------------------------------------------------
 typedef struct {
     int  speed_x10;
     BOOL natural;
@@ -112,32 +54,220 @@ typedef struct {
     BOOL autostart;
 } Settings;
 
-static Settings g_s = { 30, FALSE, TRUE, FALSE };
-
-// ---------------------------------------------------------------------------
-// Runtime state
-// ---------------------------------------------------------------------------
-static HWND             g_hwnd   = NULL;
-static NOTIFYICONDATAW  g_nid    = { 0 };
-static HANDLE           g_dev    = NULL;
-static HANDLE           g_thread = NULL;
-static volatile LONG    g_running = 0;
-static int              g_accX = 0, g_accY = 0;
-static wchar_t          g_lastOpenPath[MAX_PATH] = L"";
-
-// Forward declarations for helpers used before their definitions.
-static BOOL IsServiceInstalled(const wchar_t* name);
+typedef struct {
+    wchar_t instanceId[256];
+    wchar_t pdoName[260];
+    wchar_t pdoPath[320];
+    wchar_t service[128];
+    wchar_t sampleHwid[256];
+    BOOL    hasPdo;
+    BOOL    isBound;
+} MouseCandidate;
 
 typedef enum {
-    MM_STATE_CONNECTED = 0,
-    MM_STATE_DRIVER_MISMATCH = 1,  // mouse present but not bound to MagicMouse.sys
-    MM_STATE_NOT_PAIRED = 2,       // no present Magic Mouse device
-    MM_STATE_DRIVER_MISSING = 3    // service missing (first run / broken install)
-} MmState;
+    ST_CONNECTED = 0,
+    ST_DRIVER_MISMATCH = 1,  // mouse present but not bound to MagicMouse filter/service
+    ST_NOT_PAIRED = 2,
+    ST_DRIVER_MISSING = 3
+} AppState;
 
-// ===========================================================================
-// Settings persistence
-// ===========================================================================
+static const int kSpeedPresets[] = { 10, 20, 30, 50, 80, 100 };
+static const wchar_t* kSpeedNames[] = {
+    L"1.0x  (slow)", L"2.0x", L"3.0x  (default)",
+    L"5.0x", L"8.0x", L"10.0x (fastest)"
+};
+
+// Hardware IDs from MagicMouse.inf.
+static const wchar_t* kCanonicalHwids[] = {
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d",
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310",
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269",
+    L"USB\\Vid_05ac&Pid_0269&MI_01",
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323",
+    L"USB\\Vid_05ac&Pid_0323&MI_01",
+    NULL
+};
+
+// Tokens used to detect Magic Mouse PIDs on this machine.
+static const wchar_t* kPidTokens[] = {
+    L"PID&0269", L"PID_0269",
+    L"PID&0323", L"PID_0323",
+    L"PID&030D", L"PID_030D",
+    L"PID&0310", L"PID_0310",
+    NULL
+};
+
+static Settings g_s = { 30, FALSE, TRUE, FALSE };
+static HWND g_hwnd = NULL;
+static NOTIFYICONDATAW g_nid = { 0 };
+static HANDLE g_dev = NULL;
+static HANDLE g_thread = NULL;
+static volatile LONG g_running = 0;
+static int g_accX = 0;
+static int g_accY = 0;
+static wchar_t g_lastOpenPath[MAX_PATH] = L"";
+
+static BOOL IsServiceInstalled(const wchar_t* name);
+static AppState QueryState(int* outCandidates, int* outBound);
+
+static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
+{
+    if (!hay || !needle || !*needle) return FALSE;
+    size_t n = wcslen(needle);
+    for (const wchar_t* p = hay; *p; p++) {
+        if (_wcsnicmp(p, needle, n) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL IsMagicMouseHwid(const wchar_t* hwid)
+{
+    if (!hwid || !*hwid) return FALSE;
+    for (int i = 0; kPidTokens[i]; i++) {
+        if (ContainsI(hwid, kPidTokens[i])) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL MultiSzContainsI(const BYTE* data, DWORD bytes, const wchar_t* token)
+{
+    if (!data || !bytes || !token || !*token) return FALSE;
+    const wchar_t* p = (const wchar_t*)data;
+    DWORD remain = bytes / sizeof(wchar_t);
+    while (remain > 0 && *p) {
+        size_t len = wcslen(p);
+        if (ContainsI(p, token)) return TRUE;
+        if (len + 1 > remain) break;
+        p += len + 1;
+        remain -= (DWORD)(len + 1);
+    }
+    return FALSE;
+}
+
+static BOOL IsBoundByProps(HDEVINFO ds, SP_DEVINFO_DATA* d, wchar_t* outService, size_t cchService)
+{
+    BYTE buf[4096];
+    DWORD got = 0;
+    if (outService && cchService) outService[0] = 0;
+
+    if (SetupDiGetDeviceRegistryPropertyW(ds, d, SPDRP_SERVICE, NULL,
+            buf, sizeof(buf), &got) && got >= sizeof(wchar_t) * 2) {
+        const wchar_t* s = (const wchar_t*)buf;
+        if (outService && cchService) StringCchCopyW(outService, cchService, s);
+        if (_wcsicmp(s, L"MagicMouse") == 0) return TRUE;
+    }
+
+    got = 0;
+    if (SetupDiGetDeviceRegistryPropertyW(ds, d, SPDRP_LOWERFILTERS, NULL,
+            buf, sizeof(buf), &got) && got >= sizeof(wchar_t) * 2) {
+        if (MultiSzContainsI(buf, got, L"MagicMouse")) return TRUE;
+    }
+    return FALSE;
+}
+
+static int CollectCandidates(MouseCandidate* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+    int count = 0;
+    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (ds == INVALID_HANDLE_VALUE) return 0;
+
+    SP_DEVINFO_DATA d = { sizeof(d) };
+    BYTE hwbuf[4096];
+
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
+        DWORD got = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
+                hwbuf, sizeof(hwbuf), &got) || got < sizeof(wchar_t) * 2)
+            continue;
+
+        const wchar_t* p = (const wchar_t*)hwbuf;
+        DWORD remain = got / sizeof(wchar_t);
+        wchar_t firstMatch[256] = L"";
+        BOOL isMouse = FALSE;
+        while (remain > 0 && *p) {
+            size_t len = wcslen(p);
+            if (IsMagicMouseHwid(p)) {
+                isMouse = TRUE;
+                if (!firstMatch[0]) StringCchCopyW(firstMatch, _countof(firstMatch), p);
+            }
+            if (len + 1 > remain) break;
+            p += len + 1;
+            remain -= (DWORD)(len + 1);
+        }
+        if (!isMouse) continue;
+        if (count >= cap) break;
+
+        MouseCandidate* c = &out[count];
+        ZeroMemory(c, sizeof(*c));
+        StringCchCopyW(c->sampleHwid, _countof(c->sampleHwid), firstMatch);
+        c->isBound = IsBoundByProps(ds, &d, c->service, _countof(c->service));
+        SetupDiGetDeviceInstanceIdW(ds, &d, c->instanceId, _countof(c->instanceId), NULL);
+
+        if (SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME,
+                NULL, (BYTE*)c->pdoName, sizeof(c->pdoName), NULL)) {
+            c->hasPdo = TRUE;
+            StringCchPrintfW(c->pdoPath, _countof(c->pdoPath), L"\\\\.\\GLOBALROOT%s", c->pdoName);
+        }
+        count++;
+    }
+
+    SetupDiDestroyDeviceInfoList(ds);
+    return count;
+}
+
+static HANDLE TryOpenPath(const wchar_t* path)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileW(path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    }
+    return (h == INVALID_HANDLE_VALUE) ? NULL : h;
+}
+
+static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
+{
+    if (outBoundCount) *outBoundCount = 0;
+    if (outCandidateCount) *outCandidateCount = 0;
+    g_lastOpenPath[0] = 0;
+
+    MouseCandidate arr[MAX_CANDIDATES];
+    int n = CollectCandidates(arr, MAX_CANDIDATES);
+    if (outCandidateCount) *outCandidateCount = n;
+    if (n <= 0) return NULL;
+
+    int boundCount = 0;
+    for (int i = 0; i < n; i++) {
+        if (arr[i].isBound) boundCount++;
+    }
+    if (outBoundCount) *outBoundCount = boundCount;
+
+    // Pass 1: prefer bound devices.
+    for (int i = 0; i < n; i++) {
+        if (!arr[i].isBound || !arr[i].hasPdo) continue;
+        HANDLE h = TryOpenPath(arr[i].pdoPath);
+        if (h) {
+            StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), arr[i].pdoPath);
+            return h;
+        }
+    }
+
+    // Pass 2: fallback to any candidate PDO (covers edge cases where service/provider text
+    // still looks Microsoft but PDO path is usable).
+    for (int i = 0; i < n; i++) {
+        if (!arr[i].hasPdo) continue;
+        HANDLE h = TryOpenPath(arr[i].pdoPath);
+        if (h) {
+            StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), arr[i].pdoPath);
+            return h;
+        }
+    }
+
+    return NULL;
+}
+
 static void GetIniPath(wchar_t* out, size_t cch)
 {
     PWSTR roaming = NULL;
@@ -154,214 +284,59 @@ static void GetIniPath(wchar_t* out, size_t cch)
 static void LoadSettings(void)
 {
     wchar_t p[MAX_PATH];
-    GetIniPath(p, MAX_PATH);
-    g_s.speed_x10  =       GetPrivateProfileIntW(L"main", L"speed_x10",  30, p);
-    g_s.natural    = (BOOL)GetPrivateProfileIntW(L"main", L"natural",     0, p);
-    g_s.horizontal = (BOOL)GetPrivateProfileIntW(L"main", L"horizontal",  1, p);
-    g_s.autostart  = (BOOL)GetPrivateProfileIntW(L"main", L"autostart",   0, p);
-    if (g_s.speed_x10 < 1)   g_s.speed_x10 = 1;
+    GetIniPath(p, _countof(p));
+    g_s.speed_x10  =       GetPrivateProfileIntW(L"main", L"speed_x10", 30, p);
+    g_s.natural    = (BOOL)GetPrivateProfileIntW(L"main", L"natural", 0, p);
+    g_s.horizontal = (BOOL)GetPrivateProfileIntW(L"main", L"horizontal", 1, p);
+    g_s.autostart  = (BOOL)GetPrivateProfileIntW(L"main", L"autostart", 0, p);
+    if (g_s.speed_x10 < 1) g_s.speed_x10 = 1;
     if (g_s.speed_x10 > 200) g_s.speed_x10 = 200;
 }
 
 static void SaveSettings(void)
 {
     wchar_t p[MAX_PATH], v[16];
-    GetIniPath(p, MAX_PATH);
-    StringCchPrintfW(v, 16, L"%d", g_s.speed_x10);  WritePrivateProfileStringW(L"main", L"speed_x10",  v, p);
-    StringCchPrintfW(v, 16, L"%d", g_s.natural);    WritePrivateProfileStringW(L"main", L"natural",    v, p);
-    StringCchPrintfW(v, 16, L"%d", g_s.horizontal); WritePrivateProfileStringW(L"main", L"horizontal", v, p);
-    StringCchPrintfW(v, 16, L"%d", g_s.autostart);  WritePrivateProfileStringW(L"main", L"autostart",  v, p);
+    GetIniPath(p, _countof(p));
+    StringCchPrintfW(v, _countof(v), L"%d", g_s.speed_x10);
+    WritePrivateProfileStringW(L"main", L"speed_x10", v, p);
+    StringCchPrintfW(v, _countof(v), L"%d", g_s.natural);
+    WritePrivateProfileStringW(L"main", L"natural", v, p);
+    StringCchPrintfW(v, _countof(v), L"%d", g_s.horizontal);
+    WritePrivateProfileStringW(L"main", L"horizontal", v, p);
+    StringCchPrintfW(v, _countof(v), L"%d", g_s.autostart);
+    WritePrivateProfileStringW(L"main", L"autostart", v, p);
 }
 
 static void ApplyAutostart(void)
 {
     HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
             0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
     if (g_s.autostart) {
-        wchar_t exe[MAX_PATH], val[MAX_PATH + 4];
-        GetModuleFileNameW(NULL, exe, MAX_PATH);
-        StringCchPrintfW(val, MAX_PATH + 4, L"\"%s\"", exe);
-        RegSetValueExW(k, L"MagicMouse", 0, REG_SZ, (const BYTE*)val,
-                       (DWORD)((wcslen(val) + 1) * sizeof(wchar_t)));
+        wchar_t exe[MAX_PATH], quoted[MAX_PATH + 4];
+        GetModuleFileNameW(NULL, exe, _countof(exe));
+        StringCchPrintfW(quoted, _countof(quoted), L"\"%s\"", exe);
+        RegSetValueExW(k, L"MagicMouse", 0, REG_SZ,
+            (const BYTE*)quoted, (DWORD)((wcslen(quoted) + 1) * sizeof(wchar_t)));
     } else {
         RegDeleteValueW(k, L"MagicMouse");
     }
     RegCloseKey(k);
 }
 
-// ===========================================================================
-// Device discovery (open by service name -> physical PDO path)
-// ===========================================================================
-static HANDLE TryOpenPath(const wchar_t* path)
-{
-    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        h = CreateFileW(path, GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    }
-    return (h == INVALID_HANDLE_VALUE) ? NULL : h;
-}
-
-// Returns first openable PDO for a device whose service is "MagicMouse",
-// or NULL. Also fills outBound with the count of MagicMouse-bound devices.
-static HANDLE OpenMagicMouse(int* outBound)
-{
-    if (outBound) *outBound = 0;
-    HANDLE result = NULL;
-    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (ds == INVALID_HANDLE_VALUE) return NULL;
-
-    SP_DEVINFO_DATA d = { sizeof(d) };
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
-        wchar_t svc[64] = { 0 };
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_SERVICE, NULL,
-                (BYTE*)svc, sizeof(svc), NULL))
-            continue;
-        if (_wcsicmp(svc, L"MagicMouse") != 0) continue;
-
-        if (outBound) (*outBound)++;
-        if (result) continue;  // keep counting, but don't open more
-
-        wchar_t pdo[260] = { 0 };
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d,
-                SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, NULL,
-                (BYTE*)pdo, sizeof(pdo), NULL))
-            continue;
-
-        wchar_t full[300];
-        StringCchPrintfW(full, 300, L"\\\\.\\GLOBALROOT%s", pdo);
-        result = TryOpenPath(full);
-        if (result) StringCchCopyW(g_lastOpenPath, MAX_PATH, full);
-    }
-    SetupDiDestroyDeviceInfoList(ds);
-    return result;
-}
-
-static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
-{
-    if (!hay || !needle || !*needle) return FALSE;
-    size_t n = wcslen(needle);
-    for (const wchar_t* p = hay; *p; p++) {
-        if (_wcsnicmp(p, needle, n) == 0) return TRUE;
-    }
-    return FALSE;
-}
-
-static BOOL IsMagicMouseHardwareId(const wchar_t* hwid)
-{
-    if (!hwid || !*hwid) return FALSE;
-    for (int i = 0; kMousePidTokens[i]; i++) {
-        if (ContainsI(hwid, kMousePidTokens[i])) return TRUE;
-    }
-    return FALSE;
-}
-
-// Returns TRUE if at least one currently-present device matches a hardware
-// ID whose PID matches known Magic Mouse generations.
-static BOOL IsAnyMagicMousePresent(void)
-{
-    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (ds == INVALID_HANDLE_VALUE) return FALSE;
-
-    BOOL found = FALSE;
-    SP_DEVINFO_DATA d = { sizeof(d) };
-    BYTE buf[4096];
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d) && !found; i++) {
-        DWORD got = 0;
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
-                buf, sizeof(buf), &got) || got < 4)
-            continue;
-
-        // SPDRP_HARDWAREID returns a REG_MULTI_SZ - walk each NUL-terminated
-        // string and match on known Magic Mouse PID signatures.
-        const wchar_t* p = (const wchar_t*)buf;
-        DWORD remain = got / sizeof(wchar_t);
-        while (remain > 0 && *p) {
-            size_t len = wcslen(p);
-            if (IsMagicMouseHardwareId(p)) { found = TRUE; break; }
-            if (len + 1 > remain) break;
-            p      += len + 1;
-            remain -= (DWORD)(len + 1);
-        }
-    }
-    SetupDiDestroyDeviceInfoList(ds);
-    return found;
-}
-
-static int CollectPresentMagicMouseHwids(
-    wchar_t out[][256], int outCap, wchar_t* sample, size_t sampleCch)
-{
-    if (sample && sampleCch) sample[0] = 0;
-    if (!out || outCap <= 0) return 0;
-    int count = 0;
-
-    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (ds == INVALID_HANDLE_VALUE) return 0;
-
-    SP_DEVINFO_DATA d = { sizeof(d) };
-    BYTE buf[4096];
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
-        DWORD got = 0;
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
-                buf, sizeof(buf), &got) || got < 4)
-            continue;
-
-        const wchar_t* p = (const wchar_t*)buf;
-        DWORD remain = got / sizeof(wchar_t);
-        while (remain > 0 && *p) {
-            size_t len = wcslen(p);
-            if (IsMagicMouseHardwareId(p)) {
-                BOOL exists = FALSE;
-                for (int k = 0; k < count; k++) {
-                    if (_wcsicmp(out[k], p) == 0) { exists = TRUE; break; }
-                }
-                if (!exists && count < outCap) {
-                    StringCchCopyW(out[count], 256, p);
-                    count++;
-                    if (sample && sampleCch && !sample[0]) {
-                        StringCchCopyW(sample, sampleCch, p);
-                    }
-                }
-            }
-            if (len + 1 > remain) break;
-            p      += len + 1;
-            remain -= (DWORD)(len + 1);
-        }
-    }
-    SetupDiDestroyDeviceInfoList(ds);
-    return count;
-}
-
-static MmState QueryMouseState(void)
-{
-    if (g_dev) return MM_STATE_CONNECTED;
-    if (!IsServiceInstalled(L"MagicMouse")) return MM_STATE_DRIVER_MISSING;
-    if (IsAnyMagicMousePresent()) return MM_STATE_DRIVER_MISMATCH;
-    return MM_STATE_NOT_PAIRED;
-}
-
-// ===========================================================================
-// Read loop and SendInput
-// ===========================================================================
 static void EmitWheel(int tickY, int tickX)
 {
     INPUT in[2] = { 0 };
     int n = 0;
-    if (tickY != 0) {
-        in[n].type         = INPUT_MOUSE;
-        in[n].mi.dwFlags   = MOUSEEVENTF_WHEEL;
+    if (tickY) {
+        in[n].type = INPUT_MOUSE;
+        in[n].mi.dwFlags = MOUSEEVENTF_WHEEL;
         in[n].mi.mouseData = (DWORD)(tickY * WHEEL_DELTA);
         n++;
     }
-    if (tickX != 0 && g_s.horizontal) {
-        in[n].type         = INPUT_MOUSE;
-        in[n].mi.dwFlags   = MOUSEEVENTF_HWHEEL;
+    if (tickX && g_s.horizontal) {
+        in[n].type = INPUT_MOUSE;
+        in[n].mi.dwFlags = MOUSEEVENTF_HWHEEL;
         in[n].mi.mouseData = (DWORD)(tickX * WHEEL_DELTA);
         n++;
     }
@@ -372,22 +347,20 @@ static DWORD WINAPI ReadThread(LPVOID arg)
 {
     (void)arg;
     BYTE buf[64];
-    DWORD bytes;
+    DWORD read = 0;
+
     while (g_running && g_dev) {
-        if (!ReadFile(g_dev, buf, sizeof(buf), &bytes, NULL) || bytes < 3) {
+        if (!ReadFile(g_dev, buf, sizeof(buf), &read, NULL) || read < 3) {
             DWORD e = GetLastError();
-            if (e == ERROR_INVALID_HANDLE      ||
-                e == ERROR_DEVICE_NOT_CONNECTED ||
-                e == ERROR_OPERATION_ABORTED   ||
-                e == ERROR_NOT_READY)
-            {
+            if (e == ERROR_INVALID_HANDLE || e == ERROR_DEVICE_NOT_CONNECTED ||
+                e == ERROR_OPERATION_ABORTED || e == ERROR_NOT_READY) {
                 PostMessageW(g_hwnd, WM_DEVICE_LOST, 0, 0);
                 break;
             }
             Sleep(10);
             continue;
         }
-        // Magic Utilities raw report layout: [0]=reportId, [1]=dY, [2]=dX (signed bytes).
+
         int dy = (signed char)buf[1];
         int dx = (signed char)buf[2];
         if (g_s.natural) { dy = -dy; dx = -dx; }
@@ -395,11 +368,11 @@ static DWORD WINAPI ReadThread(LPVOID arg)
         g_accY += dy * g_s.speed_x10;
         g_accX += dx * g_s.speed_x10;
 
-        const int kT = WHEEL_DELTA * 10;  // = 1200 (speed stored as tenths)
-        int ty = g_accY / kT;
-        int tx = g_accX / kT;
-        if (ty) g_accY -= ty * kT;
-        if (tx) g_accX -= tx * kT;
+        const int step = WHEEL_DELTA * 10;
+        int ty = g_accY / step;
+        int tx = g_accX / step;
+        if (ty) g_accY -= ty * step;
+        if (tx) g_accX -= tx * step;
 
         if (ty || tx) EmitWheel(ty, tx);
     }
@@ -420,270 +393,196 @@ static void StopReader(void)
         g_thread = NULL;
     }
     g_accX = g_accY = 0;
-    g_lastOpenPath[0] = 0;
 }
 
 static BOOL StartReader(void)
 {
     StopReader();
-    g_dev = OpenMagicMouse(NULL);
+    g_dev = OpenMagicMouse(NULL, NULL);
     if (!g_dev) return FALSE;
     g_running = 1;
     g_thread = CreateThread(NULL, 0, ReadThread, NULL, 0, NULL);
-    return TRUE;
+    return (g_thread != NULL);
 }
 
-static void UpdateTrayTip(void)
+static BOOL ExtractResourceToFile(int id, const wchar_t* path)
 {
-    MmState s = QueryMouseState();
-    const wchar_t* tip = L"Magic Mouse - not connected";
-    if (s == MM_STATE_CONNECTED) tip = L"Magic Mouse - connected";
-    else if (s == MM_STATE_DRIVER_MISMATCH) tip = L"Magic Mouse - detected, driver is Microsoft";
-    else if (s == MM_STATE_NOT_PAIRED) tip = L"Magic Mouse - not paired";
-    else if (s == MM_STATE_DRIVER_MISSING) tip = L"Magic Mouse - driver not installed";
-    StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), tip);
-    g_nid.uFlags |= NIF_TIP;
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-}
+    HRSRC r = FindResourceW(NULL, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!r) return FALSE;
+    HGLOBAL h = LoadResource(NULL, r);
+    if (!h) return FALSE;
+    DWORD sz = SizeofResource(NULL, r);
+    void* p = LockResource(h);
+    if (!p || !sz) return FALSE;
 
-// ===========================================================================
-// Embedded driver extraction + auto-install
-// ===========================================================================
-static BOOL ExtractResource(int rsrcId, const wchar_t* destPath)
-{
-    HRSRC res = FindResourceW(NULL, MAKEINTRESOURCEW(rsrcId), RT_RCDATA);
-    if (!res) return FALSE;
-    HGLOBAL data = LoadResource(NULL, res);
-    if (!data) return FALSE;
-    DWORD size = SizeofResource(NULL, res);
-    void* p = LockResource(data);
-    if (!p || !size) return FALSE;
-
-    HANDLE h = CreateFileW(destPath, GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
-    DWORD written = 0;
-    BOOL ok = WriteFile(h, p, size, &written, NULL) && written == size;
-    CloseHandle(h);
-    if (!ok) DeleteFileW(destPath);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD wr = 0;
+    BOOL ok = WriteFile(f, p, sz, &wr, NULL) && wr == sz;
+    CloseHandle(f);
+    if (!ok) DeleteFileW(path);
     return ok;
 }
 
-static BOOL ExtractDriversToTemp(wchar_t* outDir, size_t cchDir)
+static BOOL ExtractDriversToTemp(wchar_t* outDir, size_t cchDir, wchar_t* outInf, size_t cchInf)
 {
-    wchar_t tempBase[MAX_PATH];
-    if (!GetTempPathW(MAX_PATH, tempBase)) return FALSE;
-    StringCchPrintfW(outDir, cchDir, L"%sMagicMouseDrv-%lu", tempBase, GetCurrentProcessId());
-    if (!CreateDirectoryW(outDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-        return FALSE;
+    wchar_t tmp[MAX_PATH];
+    if (!GetTempPathW(_countof(tmp), tmp)) return FALSE;
+    StringCchPrintfW(outDir, cchDir, L"%sMagicMouseDrv-%lu", tmp, GetCurrentProcessId());
+    if (!CreateDirectoryW(outDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return FALSE;
 
     wchar_t inf[MAX_PATH], sys[MAX_PATH], cat[MAX_PATH];
-    StringCchPrintfW(inf, MAX_PATH, L"%s\\MagicMouse.inf", outDir);
-    StringCchPrintfW(sys, MAX_PATH, L"%s\\MagicMouse.sys", outDir);
-    StringCchPrintfW(cat, MAX_PATH, L"%s\\MagicMouse.cat", outDir);
+    StringCchPrintfW(inf, _countof(inf), L"%s\\MagicMouse.inf", outDir);
+    StringCchPrintfW(sys, _countof(sys), L"%s\\MagicMouse.sys", outDir);
+    StringCchPrintfW(cat, _countof(cat), L"%s\\MagicMouse.cat", outDir);
 
-    return ExtractResource(RES_DRV_INF, inf)
-        && ExtractResource(RES_DRV_SYS, sys)
-        && ExtractResource(RES_DRV_CAT, cat);
+    if (!ExtractResourceToFile(RES_DRV_INF, inf)) return FALSE;
+    if (!ExtractResourceToFile(RES_DRV_SYS, sys)) return FALSE;
+    if (!ExtractResourceToFile(RES_DRV_CAT, cat)) return FALSE;
+
+    if (outInf && cchInf) StringCchCopyW(outInf, cchInf, inf);
+    return TRUE;
 }
 
-static void DeleteFolderRecursive(const wchar_t* dir)
+static void RemoveTempDir(const wchar_t* dir)
 {
-    wchar_t pattern[MAX_PATH];
-    StringCchPrintfW(pattern, MAX_PATH, L"%s\\*", dir);
+    wchar_t pat[MAX_PATH];
+    StringCchPrintfW(pat, _countof(pat), L"%s\\*", dir);
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pattern, &fd);
+    HANDLE h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-            wchar_t full[MAX_PATH];
-            StringCchPrintfW(full, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-            DeleteFileW(full);
+            wchar_t p[MAX_PATH];
+            StringCchPrintfW(p, _countof(p), L"%s\\%s", dir, fd.cFileName);
+            DeleteFileW(p);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
     RemoveDirectoryW(dir);
 }
 
-// Run a console process synchronously, hidden, return exit code only.
-// We deliberately do NOT capture stdout: modern pnputil emits UTF-16 LE
-// with a BOM on some locales while reverting to OEM/ACP on others, which
-// makes pretty-printing a moving target. The exit code is enough.
 static DWORD RunWait(const wchar_t* cmdline)
 {
     STARTUPINFOW si = { sizeof(si) };
-    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = { 0 };
 
     wchar_t mut[1024];
-    StringCchCopyW(mut, 1024, cmdline);
-    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE,
-            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    StringCchCopyW(mut, _countof(mut), cmdline);
+    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return (DWORD)-1;
-    }
+
     WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    DWORD rc = 0;
+    GetExitCodeProcess(pi.hProcess, &rc);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return exitCode;
+    return rc;
 }
 
-// Returns TRUE if the named kernel service is registered with the SCM.
-// We use this to distinguish "INF was never installed" (->offer install)
-// from "INF is in driver store but mouse isn't connected" (->just wait).
 static BOOL IsServiceInstalled(const wchar_t* name)
 {
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm) return FALSE;
     SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
-    BOOL found = (svc != NULL);
+    BOOL ok = (svc != NULL);
     if (svc) CloseServiceHandle(svc);
     CloseServiceHandle(scm);
-    return found;
+    return ok;
 }
 
-// ELEVATED entry point.
-//
-// Steps:
-//   1. Extract the three embedded driver files to %TEMP%.
-//   2. `pnputil /add-driver MagicMouse.inf /install` - registers the INF in
-//      the driver store so future device arrivals find it.
-//   3. For every hardware ID listed in the INF, ask Windows to update the
-//      driver of any *currently present* matching device to MagicMouse.sys
-//      via UpdateDriverForPlugAndPlayDevicesW. INSTALLFLAG_FORCE makes it
-//      override Windows' built-in HID driver even when Windows considered
-//      that driver "already good enough".
-//   4. Verify and report.
-//
-// IMPORTANT: We deliberately do NOT call `pnputil /remove-device` on
-// anything. The previous version of this code did, and it could blow away
-// other Bluetooth devices (Apple Magic Keyboard, AirPods etc) because
-// detection was VID-based. UpdateDriverForPlugAndPlayDevicesW is precise:
-// it touches exactly the PIDs we list, nothing else.
 static int RunDriverInstallElevated(void)
 {
-    wchar_t dir[MAX_PATH];
-    if (!ExtractDriversToTemp(dir, MAX_PATH)) {
-        MessageBoxW(NULL,
-            L"Failed to extract the embedded driver files to %TEMP%.\r\n"
-            L"Free some disk space and try again.",
-            L"Magic Mouse - Install error", MB_OK | MB_ICONERROR);
+    wchar_t dir[MAX_PATH], infPath[MAX_PATH];
+    if (!ExtractDriversToTemp(dir, _countof(dir), infPath, _countof(infPath))) {
+        MessageBoxW(NULL, L"Failed to extract embedded driver files.", L"Magic Mouse", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    wchar_t infPath[MAX_PATH];
-    StringCchPrintfW(infPath, MAX_PATH, L"%s\\MagicMouse.inf", dir);
-
-    // Step 1: register INF in the driver store.
     wchar_t cmd[1024];
-    StringCchPrintfW(cmd, 1024,
-        L"pnputil.exe /add-driver \"%s\" /install", infPath);
-    DWORD rcAdd = RunWait(cmd);
+    StringCchPrintfW(cmd, _countof(cmd), L"pnputil.exe /add-driver \"%s\" /install", infPath);
+    DWORD addRc = RunWait(cmd);
 
-    // Step 2: enumerate REAL currently-present Magic Mouse hardware IDs and
-    // update driver for those exact IDs. This is much more robust than using
-    // a hardcoded whitelist only, because the stack may append extra suffixes.
+    // Update currently present REAL HWIDs first (most reliable), then canonical IDs.
+    MouseCandidate arr[MAX_CANDIDATES];
+    int n = CollectCandidates(arr, MAX_CANDIDATES);
+    int tries = 0;
     int updated = 0;
-    int triedHwid = 0;
-    BOOL anyReboot = FALSE;
-    wchar_t hwids[32][256];
-    wchar_t sampleHwid[256] = L"";
-    int presentCount = CollectPresentMagicMouseHwids(hwids, 32, sampleHwid, _countof(sampleHwid));
-    for (int i = 0; i < presentCount; i++) {
-        triedHwid++;
-        BOOL reboot = FALSE;
-        if (UpdateDriverForPlugAndPlayDevicesW(NULL, hwids[i], infPath,
-                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &reboot)) {
+    BOOL rebootNeeded = FALSE;
+
+    for (int i = 0; i < n; i++) {
+        if (!arr[i].sampleHwid[0]) continue;
+        BOOL rb = FALSE;
+        tries++;
+        if (UpdateDriverForPlugAndPlayDevicesW(NULL, arr[i].sampleHwid, infPath,
+                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &rb)) {
             updated++;
-            if (reboot) anyReboot = TRUE;
+            if (rb) rebootNeeded = TRUE;
         }
     }
-    // Fallback for unplugged/unpaired-at-runtime cases: ask Windows with the
-    // canonical INF IDs as well, so future arrivals can bind without rerun.
-    for (int i = 0; kMouseHwids[i]; i++) {
-        triedHwid++;
-        BOOL reboot = FALSE;
-        if (UpdateDriverForPlugAndPlayDevicesW(NULL, kMouseHwids[i], infPath,
-                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &reboot)) {
+    for (int i = 0; kCanonicalHwids[i]; i++) {
+        BOOL rb = FALSE;
+        tries++;
+        if (UpdateDriverForPlugAndPlayDevicesW(NULL, kCanonicalHwids[i], infPath,
+                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &rb)) {
             updated++;
-            if (reboot) anyReboot = TRUE;
+            if (rb) rebootNeeded = TRUE;
         }
     }
 
-    Sleep(800);
-
-    // Step 3: verify.
-    int bound = 0;
-    HANDLE check = OpenMagicMouse(&bound);
-    if (check) CloseHandle(check);
-    BOOL serviceOk = IsServiceInstalled(L"MagicMouse");
-
-    DeleteFolderRecursive(dir);
+    Sleep(1200);
+    int bound = 0, cands = 0;
+    HANDLE h = OpenMagicMouse(&bound, &cands);
+    if (h) CloseHandle(h);
+    BOOL svcOk = IsServiceInstalled(L"MagicMouse");
+    RemoveTempDir(dir);
 
     if (bound > 0) {
         MessageBoxW(NULL,
-            anyReboot
-              ? L"Driver installed and bound to your Magic Mouse.\r\n"
-                L"Windows is asking for a reboot to finalize - reboot when\r\n"
-                L"convenient. Scrolling will work after this dialog closes."
-              : L"Driver installed and bound to your Magic Mouse.\r\n"
-                L"Close this dialog; the tray app will resume automatically.",
-            L"Magic Mouse - Install OK", MB_OK | MB_ICONINFORMATION);
+            rebootNeeded
+                ? L"Driver installed and bound.\r\nWindows requested a reboot to fully finalize."
+                : L"Driver installed and bound.\r\nThe app will reconnect automatically.",
+            L"Magic Mouse - OK", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
 
-    if (!serviceOk) {
+    if (!svcOk) {
         wchar_t msg[512];
         StringCchPrintfW(msg, _countof(msg),
-            L"Failed to register the driver with Windows.\r\n\r\n"
-            L"pnputil exit code: %lu\r\n\r\n"
-            L"Make sure you accepted the UAC prompt and that no other Magic\r\n"
-            L"Mouse driver (e.g. the official Magic Utilities) is installed.",
-            rcAdd);
-        MessageBoxW(NULL, msg, L"Magic Mouse - Install error",
-            MB_OK | MB_ICONERROR);
+            L"Driver registration failed.\r\npnputil exit code: %lu\r\n\r\n"
+            L"Make sure UAC was accepted and no conflicting package is locking the driver.",
+            addRc);
+        MessageBoxW(NULL, msg, L"Magic Mouse - Install error", MB_OK | MB_ICONERROR);
         return 2;
     }
 
-    // Driver is in the store but UpdateDriverForPlugAndPlayDevicesW didn't
-    // match anything (or matched but PnP hasn't finished re-binding yet).
-    wchar_t msg[1400];
+    wchar_t sample[256] = L"(none)";
+    if (n > 0 && arr[0].sampleHwid[0]) StringCchCopyW(sample, _countof(sample), arr[0].sampleHwid);
+
+    wchar_t msg[1200];
     StringCchPrintfW(msg, _countof(msg),
-        L"The Magic Mouse driver is registered, but no Magic Mouse is\r\n"
-        L"currently bound to it (updated calls: %d / %d).\r\n\r\n"
-        L"Detected Magic Mouse hardware IDs right now: %d\r\n"
+        L"Driver is installed, but no device is currently bound.\r\n\r\n"
+        L"Candidates found now: %d\r\n"
+        L"Bound count: %d\r\n"
+        L"Update calls succeeded: %d / %d\r\n"
         L"Sample HWID: %s\r\n\r\n"
-        L"What to try:\r\n\r\n"
-        L"  1. Make sure the mouse is paired and turned on, then click\r\n"
-        L"     \"Reconnect\" in the tray menu.\r\n"
-        L"  2. If that doesn't help, open Settings -> Bluetooth & devices,\r\n"
-        L"     remove the Magic Mouse, then pair it again. The new driver\r\n"
-        L"     will bind on first connection.\r\n"
-        L"  3. As a last resort, reboot Windows.\r\n\r\n"
-        L"Other Bluetooth devices (keyboard, headphones, ...) are NOT\r\n"
-        L"affected - this installer only touches the Magic Mouse PIDs.",
-        updated, triedHwid, presentCount, sampleHwid[0] ? sampleHwid : L"(none)");
-    MessageBoxW(NULL, msg,
-        L"Magic Mouse - Driver registered, no mouse bound",
-        MB_OK | MB_ICONINFORMATION);
+        L"Try: Reconnect in tray, or remove/re-pair Magic Mouse in Bluetooth settings.",
+        cands, bound, updated, tries, sample);
+    MessageBoxW(NULL, msg, L"Magic Mouse - Not bound", MB_OK | MB_ICONINFORMATION);
     return 0;
 }
 
-// ===========================================================================
-// UAC relaunch helper
-// ===========================================================================
 static BOOL IsRunningAsAdmin(void)
 {
     BOOL admin = FALSE;
-    PSID admGroup = NULL;
+    PSID sid = NULL;
     SID_IDENTIFIER_AUTHORITY auth = SECURITY_NT_AUTHORITY;
-    if (AllocateAndInitializeSid(&auth, 2,
-            SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-            0, 0, 0, 0, 0, 0, &admGroup)) {
-        CheckTokenMembership(NULL, admGroup, &admin);
-        FreeSid(admGroup);
+    if (AllocateAndInitializeSid(&auth, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0, &sid)) {
+        CheckTokenMembership(NULL, sid, &admin);
+        FreeSid(sid);
     }
     return admin;
 }
@@ -691,28 +590,24 @@ static BOOL IsRunningAsAdmin(void)
 static void RelaunchInstallerElevated(void)
 {
     wchar_t self[MAX_PATH];
-    GetModuleFileNameW(NULL, self, MAX_PATH);
+    GetModuleFileNameW(NULL, self, _countof(self));
 
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.fMask  = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = L"runas";
-    sei.lpFile = self;
-    sei.lpParameters = ARG_INSTALL_DRIVER;
-    sei.nShow  = SW_SHOW;
-
-    if (!ShellExecuteExW(&sei)) {
-        DWORD e = GetLastError();
-        if (e == ERROR_CANCELLED) return;  // user clicked No on UAC
-        MessageBoxW(NULL, L"Failed to launch elevated installer.",
-            L"Magic Mouse", MB_OK | MB_ICONERROR);
+    SHELLEXECUTEINFOW se = { sizeof(se) };
+    se.fMask = SEE_MASK_NOCLOSEPROCESS;
+    se.lpVerb = L"runas";
+    se.lpFile = self;
+    se.lpParameters = ARG_INSTALL_DRIVER;
+    se.nShow = SW_SHOW;
+    if (!ShellExecuteExW(&se)) {
+        if (GetLastError() != ERROR_CANCELLED) {
+            MessageBoxW(NULL, L"Failed to launch elevated installer.", L"Magic Mouse", MB_OK | MB_ICONERROR);
+        }
         return;
     }
-    if (sei.hProcess) {
-        // Wait for the elevated installer to finish but keep the tray
-        // responsive by pumping messages.
+
+    if (se.hProcess) {
         for (;;) {
-            DWORD r = MsgWaitForMultipleObjects(1, &sei.hProcess, FALSE,
-                INFINITE, QS_ALLINPUT);
+            DWORD r = MsgWaitForMultipleObjects(1, &se.hProcess, FALSE, INFINITE, QS_ALLINPUT);
             if (r == WAIT_OBJECT_0) break;
             MSG m;
             while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
@@ -720,46 +615,61 @@ static void RelaunchInstallerElevated(void)
                 DispatchMessageW(&m);
             }
         }
-        CloseHandle(sei.hProcess);
+        CloseHandle(se.hProcess);
     }
+}
+
+static AppState QueryState(int* outCandidates, int* outBound)
+{
+    if (g_dev) {
+        if (outCandidates) *outCandidates = 1;
+        if (outBound) *outBound = 1;
+        return ST_CONNECTED;
+    }
+    int bound = 0, cands = 0;
+    HANDLE h = OpenMagicMouse(&bound, &cands);
+    if (h) {
+        CloseHandle(h);
+        if (outCandidates) *outCandidates = cands;
+        if (outBound) *outBound = bound > 0 ? bound : 1;
+        return ST_CONNECTED;
+    }
+    if (outCandidates) *outCandidates = cands;
+    if (outBound) *outBound = bound;
+    if (!IsServiceInstalled(L"MagicMouse")) return ST_DRIVER_MISSING;
+    if (cands > 0) return ST_DRIVER_MISMATCH;
+    return ST_NOT_PAIRED;
+}
+
+static void UpdateTrayTip(void)
+{
+    AppState st = QueryState(NULL, NULL);
+    const wchar_t* tip = L"Magic Mouse - not connected";
+    if (st == ST_CONNECTED) tip = L"Magic Mouse - connected";
+    else if (st == ST_DRIVER_MISMATCH) tip = L"Magic Mouse - detected, driver not bound";
+    else if (st == ST_NOT_PAIRED) tip = L"Magic Mouse - not paired";
+    else if (st == ST_DRIVER_MISSING) tip = L"Magic Mouse - driver not installed";
+    StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), tip);
+    g_nid.uFlags |= NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
 static void OfferDriverInstall(BOOL forceAsk)
 {
-    int boundCount = 0;
-    HANDLE h = OpenMagicMouse(&boundCount);
-    if (h) CloseHandle(h);
-
-    BOOL serviceOk  = IsServiceInstalled(L"MagicMouse");
-    BOOL mousePresent = IsAnyMagicMousePresent();
-
+    int cands = 0, bound = 0;
+    AppState st = QueryState(&cands, &bound);
     const wchar_t* msg = NULL;
-    if (boundCount > 0) {
+
+    if (st == ST_CONNECTED) {
         if (!forceAsk) return;
-        msg = L"The driver is installed and your Magic Mouse is bound to it.\r\n"
-              L"Reinstall it anyway?";
-    } else if (!serviceOk) {
-        // Real first run - INF was never registered.
-        msg = L"The Magic Mouse driver isn't installed on this PC yet.\r\n\r\n"
-              L"Install the bundled driver now?\r\n"
-              L"Windows will ask for administrator approval once.";
-    } else if (!mousePresent) {
-        // Driver installed but no compatible Magic Mouse is paired.
+        msg = L"Driver is already working. Reinstall anyway?";
+    } else if (st == ST_DRIVER_MISSING) {
+        msg = L"Magic Mouse driver is not installed.\r\n\r\nInstall bundled driver now?";
+    } else if (st == ST_NOT_PAIRED) {
         if (!forceAsk) return;
-        msg = L"The driver is already installed, but no Magic Mouse is\r\n"
-              L"currently paired with this PC. Pair the mouse via\r\n"
-              L"Settings -> Bluetooth & devices, then click \"Reconnect\".\r\n\r\n"
-              L"Run the installer anyway?";
+        msg = L"No Magic Mouse is currently paired/online.\r\n\r\nRun installer anyway?";
     } else {
-        // The mouse IS visible to Windows, but bound to a different driver
-        // (typically Microsoft's built-in HID stack).
-        msg = L"Your Magic Mouse is detected, but it's currently using\r\n"
-              L"Windows' default driver instead of MagicMouse.sys, so\r\n"
-              L"two-finger scrolling doesn't work yet.\r\n\r\n"
-              L"Switch to the bundled driver now?\r\n"
-              L"Windows will ask for administrator approval once.\r\n\r\n"
-              L"(Only your Magic Mouse will be touched - Bluetooth keyboard,\r\n"
-              L"AirPods and other devices are not affected.)";
+        msg = L"Magic Mouse is detected, but driver is not bound for scrolling.\r\n\r\nTry to switch driver now?";
     }
 
     int r = MessageBoxW(NULL, msg, L"Magic Mouse - Driver setup",
@@ -767,100 +677,111 @@ static void OfferDriverInstall(BOOL forceAsk)
     if (r != IDYES) return;
 
     if (IsRunningAsAdmin()) RunDriverInstallElevated();
-    else                    RelaunchInstallerElevated();
+    else RelaunchInstallerElevated();
 
     StartReader();
     UpdateTrayTip();
 }
 
-// ===========================================================================
-// Tray icon (programmatic 16x16 white circle + blue dot)
-// ===========================================================================
+static void ShowStatus(void)
+{
+    int cands = 0, bound = 0;
+    AppState st = QueryState(&cands, &bound);
+    const wchar_t* stateText = L"unknown";
+    if (st == ST_CONNECTED) stateText = L"connected";
+    else if (st == ST_DRIVER_MISMATCH) stateText = L"driver mismatch";
+    else if (st == ST_NOT_PAIRED) stateText = L"not paired";
+    else if (st == ST_DRIVER_MISSING) stateText = L"driver missing";
+
+    wchar_t msg[1024];
+    StringCchPrintfW(msg, _countof(msg),
+        L"State: %s\r\nCandidates: %d\r\nBound count: %d\r\nLast open path: %s\r\n",
+        stateText, cands, bound, g_lastOpenPath[0] ? g_lastOpenPath : L"(none)");
+    MessageBoxW(NULL, msg, L"Magic Mouse - Status", MB_OK | MB_ICONINFORMATION);
+}
+
 static HICON CreateTrayIcon(void)
 {
     BITMAPINFO bi = { 0 };
-    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = 16;
-    bi.bmiHeader.biHeight      = 16;
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 16;
+    bi.bmiHeader.biHeight = 16;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
     UINT32* bits = NULL;
     HDC hdc = GetDC(NULL);
-    HBITMAP hbm = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
+    HBITMAP color = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
     ReleaseDC(NULL, hdc);
-    if (!hbm || !bits) return LoadIconW(NULL, IDI_APPLICATION);
+    if (!color || !bits) return LoadIconW(NULL, IDI_APPLICATION);
 
     for (int y = 0; y < 16; y++) {
         for (int x = 0; x < 16; x++) {
             int dx = x - 8, dy = y - 8;
             int d2 = dx * dx + dy * dy;
             UINT32* px = &bits[(15 - y) * 16 + x];
-            if      (d2 <= 9)  *px = 0xFF0A84FFu;
+            if (d2 <= 9) *px = 0xFF0A84FFu;
             else if (d2 <= 49) *px = 0xFFFFFFFFu;
-            else               *px = 0x00000000u;
+            else *px = 0x00000000u;
         }
     }
 
     HBITMAP mask = CreateBitmap(16, 16, 1, 1, NULL);
     ICONINFO ii = { 0 };
-    ii.fIcon = TRUE; ii.hbmMask = mask; ii.hbmColor = hbm;
-    HICON icon = CreateIconIndirect(&ii);
-    DeleteObject(hbm);
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    HICON ico = CreateIconIndirect(&ii);
     DeleteObject(mask);
-    return icon ? icon : LoadIconW(NULL, IDI_APPLICATION);
+    DeleteObject(color);
+    return ico ? ico : LoadIconW(NULL, IDI_APPLICATION);
 }
 
-// ===========================================================================
-// Tray menu
-// ===========================================================================
 static void ShowTrayMenu(void)
 {
     POINT pt;
     GetCursorPos(&pt);
 
-    HMENU menu = CreatePopupMenu();
-    HMENU spd  = CreatePopupMenu();
+    HMENU m = CreatePopupMenu();
+    HMENU speed = CreatePopupMenu();
 
     for (int i = 0; i < (int)_countof(kSpeedPresets); i++) {
         UINT f = MF_STRING;
         if (g_s.speed_x10 == kSpeedPresets[i]) f |= MF_CHECKED;
-        AppendMenuW(spd, f, ID_M_SPEED_BASE + kSpeedPresets[i], kSpeedNames[i]);
+        AppendMenuW(speed, f, ID_M_SPEED_BASE + kSpeedPresets[i], kSpeedNames[i]);
     }
 
-    MmState st = QueryMouseState();
+    AppState st = QueryState(NULL, NULL);
     const wchar_t* title = L"Magic Mouse  [not connected]";
-    if (st == MM_STATE_CONNECTED) title = L"Magic Mouse  [connected]";
-    else if (st == MM_STATE_DRIVER_MISMATCH) title = L"Magic Mouse  [detected, Microsoft driver]";
-    else if (st == MM_STATE_NOT_PAIRED) title = L"Magic Mouse  [not paired]";
-    else if (st == MM_STATE_DRIVER_MISSING) title = L"Magic Mouse  [driver missing]";
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, title);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_POPUP, (UINT_PTR)spd, L"Scroll speed");
-    AppendMenuW(menu, MF_STRING | (g_s.natural    ? MF_CHECKED : 0), ID_M_NATURAL,    L"Natural scroll");
-    AppendMenuW(menu, MF_STRING | (g_s.horizontal ? MF_CHECKED : 0), ID_M_HORIZONTAL, L"Horizontal scroll");
-    AppendMenuW(menu, MF_STRING | (g_s.autostart  ? MF_CHECKED : 0), ID_M_AUTOSTART,  L"Start with Windows");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_M_RECONNECT, L"Reconnect");
-    AppendMenuW(menu, MF_STRING, ID_M_REINSTALL, L"Reinstall driver...");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, ID_M_QUIT, L"Quit");
+    if (st == ST_CONNECTED) title = L"Magic Mouse  [connected]";
+    else if (st == ST_DRIVER_MISMATCH) title = L"Magic Mouse  [detected, driver not bound]";
+    else if (st == ST_NOT_PAIRED) title = L"Magic Mouse  [not paired]";
+    else if (st == ST_DRIVER_MISSING) title = L"Magic Mouse  [driver missing]";
+
+    AppendMenuW(m, MF_STRING | MF_DISABLED, 0, title);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)speed, L"Scroll speed");
+    AppendMenuW(m, MF_STRING | (g_s.natural ? MF_CHECKED : 0), ID_M_NATURAL, L"Natural scroll");
+    AppendMenuW(m, MF_STRING | (g_s.horizontal ? MF_CHECKED : 0), ID_M_HORIZONTAL, L"Horizontal scroll");
+    AppendMenuW(m, MF_STRING | (g_s.autostart ? MF_CHECKED : 0), ID_M_AUTOSTART, L"Start with Windows");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_M_RECONNECT, L"Reconnect");
+    AppendMenuW(m, MF_STRING, ID_M_REINSTALL, L"Reinstall driver...");
+    AppendMenuW(m, MF_STRING, ID_M_STATUS, L"Status...");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_M_QUIT, L"Quit");
 
     SetForegroundWindow(g_hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
-    DestroyMenu(menu);
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
 }
 
-// ===========================================================================
-// Window procedure
-// ===========================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
         case WM_TRAY:
-            if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
-                ShowTrayMenu();
+            if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_RBUTTONUP) ShowTrayMenu();
             return 0;
 
         case WM_COMMAND: {
@@ -870,10 +791,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SaveSettings();
                 return 0;
             }
+
             switch (id) {
-                case ID_M_NATURAL:    g_s.natural    = !g_s.natural;    SaveSettings(); break;
-                case ID_M_HORIZONTAL: g_s.horizontal = !g_s.horizontal; SaveSettings(); break;
-                case ID_M_AUTOSTART:  g_s.autostart  = !g_s.autostart;  SaveSettings(); ApplyAutostart(); break;
+                case ID_M_NATURAL:
+                    g_s.natural = !g_s.natural;
+                    SaveSettings();
+                    break;
+                case ID_M_HORIZONTAL:
+                    g_s.horizontal = !g_s.horizontal;
+                    SaveSettings();
+                    break;
+                case ID_M_AUTOSTART:
+                    g_s.autostart = !g_s.autostart;
+                    SaveSettings();
+                    ApplyAutostart();
+                    break;
                 case ID_M_RECONNECT:
                     StartReader();
                     UpdateTrayTip();
@@ -881,6 +813,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break;
                 case ID_M_REINSTALL:
                     OfferDriverInstall(TRUE);
+                    break;
+                case ID_M_STATUS:
+                    ShowStatus();
                     break;
                 case ID_M_QUIT:
                     StopReader();
@@ -901,9 +836,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (wp == 1) {
                 if (StartReader()) KillTimer(hwnd, 1);
                 UpdateTrayTip();
-                // Don't pop install prompts from the timer - if the user
-                // dismissed it once we won't keep asking. Use the
-                // "Reinstall driver..." menu item to retry on demand.
             }
             return 0;
 
@@ -916,19 +848,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ===========================================================================
-// Entry point
-// ===========================================================================
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdLine, int show)
 {
-    (void)prev; (void)show;
+    (void)prev;
+    (void)show;
 
-    // Hidden mode: this process was relaunched with --install-driver as admin.
     if (cmdLine && wcsstr(cmdLine, ARG_INSTALL_DRIVER)) {
         return RunDriverInstallElevated();
     }
 
-    // Single-instance guard for normal mode
     HANDLE mtx = CreateMutexW(NULL, TRUE, L"Global\\MagicMouseSimple_SingleInstance");
     if (mtx == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (mtx) CloseHandle(mtx);
@@ -939,31 +867,25 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdLine, int show)
     if (g_s.autostart) ApplyAutostart();
 
     WNDCLASSW wc = { 0 };
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInst;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
     wc.lpszClassName = L"MagicMouseTrayWnd";
     RegisterClassW(&wc);
 
-    g_hwnd = CreateWindowW(L"MagicMouseTrayWnd", L"MagicMouse",
-        0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
+    g_hwnd = CreateWindowW(L"MagicMouseTrayWnd", L"MagicMouse", 0,
+        0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
 
-    g_nid.cbSize           = sizeof(g_nid);
-    g_nid.hWnd             = g_hwnd;
-    g_nid.uID              = ID_TRAY;
-    g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = ID_TRAY;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon            = CreateTrayIcon();
+    g_nid.hIcon = CreateTrayIcon();
     StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), L"Magic Mouse");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-    // Try to connect immediately. If we can't, only offer the install
-    // dialog when the kernel service genuinely isn't registered (= true
-    // first run). Otherwise just spin on the reconnect timer; the user
-    // can still kick off "Reinstall driver..." manually from the tray.
     if (!StartReader()) {
-        if (!IsServiceInstalled(L"MagicMouse")) {
-            OfferDriverInstall(FALSE);
-        }
+        if (!IsServiceInstalled(L"MagicMouse")) OfferDriverInstall(FALSE);
         SetTimer(g_hwnd, 1, 3000, NULL);
     }
     UpdateTrayTip();
@@ -974,6 +896,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdLine, int show)
         DispatchMessageW(&msg);
     }
 
-    if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
+    if (mtx) {
+        ReleaseMutex(mtx);
+        CloseHandle(mtx);
+    }
     return 0;
 }
+
