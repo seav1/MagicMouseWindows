@@ -16,7 +16,7 @@ namespace MagicMouseApp
 
     public class DeviceReader : IDisposable
     {
-        // ---------- Win32 / HID / SetupAPI imports ----------
+        // ---------- Win32 imports ----------
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern SafeFileHandle CreateFile(
             string lpFileName, uint dwDesiredAccess, uint dwShareMode,
@@ -31,6 +31,7 @@ namespace MagicMouseApp
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CancelIoEx(SafeFileHandle hFile, IntPtr lpOverlapped);
 
+        // ---------- HID API (only used as a fallback) ----------
         [DllImport("hid.dll")]
         private static extern void HidD_GetHidGuid(out Guid HidGuid);
 
@@ -66,10 +67,23 @@ namespace MagicMouseApp
                 NumberFeatureDataIndices;
         }
 
-        // SetupAPI
+        // ---------- SetupAPI ----------
+        [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetupDiGetClassDevs(IntPtr ClassGuid, IntPtr Enumerator,
+            IntPtr hwndParent, uint Flags);
+
         [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, IntPtr Enumerator,
             IntPtr hwndParent, uint Flags);
+
+        [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex,
+            ref SP_DEVINFO_DATA DeviceInfoData);
+
+        [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern bool SetupDiGetDeviceRegistryProperty(IntPtr DeviceInfoSet,
+            ref SP_DEVINFO_DATA DeviceInfoData, uint Property, out uint PropertyRegDataType,
+            IntPtr PropertyBuffer, uint PropertyBufferSize, out uint RequiredSize);
 
         [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData,
@@ -80,13 +94,17 @@ namespace MagicMouseApp
             ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData,
             uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
 
-        [DllImport("setupapi.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet,
-            ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData,
-            uint DeviceInterfaceDetailDataSize, IntPtr RequiredSize, IntPtr DeviceInfoData);
-
         [DllImport("setupapi.dll")]
         private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SP_DEVINFO_DATA
+        {
+            public int cbSize;
+            public Guid ClassGuid;
+            public uint DevInst;
+            public IntPtr Reserved;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SP_DEVICE_INTERFACE_DATA
@@ -97,6 +115,7 @@ namespace MagicMouseApp
             public IntPtr Reserved;
         }
 
+        // ---------- Constants ----------
         private const uint GENERIC_READ          = 0x80000000;
         private const uint GENERIC_WRITE         = 0x40000000;
         private const uint FILE_SHARE_READ       = 0x00000001;
@@ -105,19 +124,44 @@ namespace MagicMouseApp
         private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
 
         private const uint DIGCF_PRESENT         = 0x00000002;
+        private const uint DIGCF_ALLCLASSES      = 0x00000004;
         private const uint DIGCF_DEVICEINTERFACE = 0x00000010;
 
-        private const int  ERROR_INVALID_HANDLE  = 6;
-        private const int  ERROR_DEVICE_NOT_CONNECTED = 1167;
-        private const int  ERROR_OPERATION_ABORTED = 995;
+        // SetupDiGetDeviceRegistryProperty / SPDRP_*
+        private const uint SPDRP_SERVICE                       = 0x00000004;
+        private const uint SPDRP_HARDWAREID                    = 0x00000001;
+        private const uint SPDRP_FRIENDLYNAME                  = 0x0000000C;
+        private const uint SPDRP_PHYSICAL_DEVICE_OBJECT_NAME   = 0x0000000E;
+        private const uint SPDRP_LOCATION_INFORMATION          = 0x0000000D;
+        private const uint SPDRP_DEVICEDESC                    = 0x00000000;
 
-        private const int  APPLE_VID            = 0x05AC;
-        // Apple Magic Mouse PIDs (covers original, Magic Mouse 2, USB-C 2024 model)
-        private static readonly ushort[] MagicMousePids = new ushort[]
+        private const int  ERROR_INVALID_HANDLE         = 6;
+        private const int  ERROR_DEVICE_NOT_CONNECTED   = 1167;
+        private const int  ERROR_OPERATION_ABORTED      = 995;
+        private const int  ERROR_NO_MORE_ITEMS          = 259;
+
+        private const int  APPLE_VID = 0x05AC;
+
+        // The service name used by Magic Utilities' kernel driver. The driver creates
+        // a non-HID raw PDO (named e.g. "\Device\00000416") that the userland app reads
+        // touch reports from. The PnP-assigned PDO number differs on every machine, so
+        // we MUST look it up dynamically rather than hard-coding it.
+        private static readonly string[] MagicMouseServiceNames = new[]
         {
-            0x030D, // Magic Mouse (Bluetooth)
-            0x0269, // Magic Mouse 2
-            0x0323, // Magic Mouse (USB-C variant, A3204 - placeholder if reported)
+            "MagicMouse",          // Magic Utilities mouse driver
+            "MagicMouseUSB",       // possible USB-C variant
+            "MagicMouseHID",       // possible alt name
+            "AppleMagicMouse",     // long-shot
+        };
+
+        // Some custom drivers also publish a friendly DOS name. We try these as a final
+        // fallback - they will simply not exist on most systems and that's fine.
+        private static readonly string[] FallbackSymbolicLinks = new[]
+        {
+            @"\\.\MagicMouse",
+            @"\\.\MagicMouseRawPDO",
+            @"\\.\MagicMouseUSB",
+            @"\\.\GLOBALROOT\Device\MagicMouseRawPDO",
         };
 
         // ---------- Instance state ----------
@@ -131,40 +175,74 @@ namespace MagicMouseApp
         public event Action<string>? StatusChanged;
         public event Action? DeviceDisconnected;
 
-        // Common symbolic-link fallbacks (some custom drivers expose these)
-        private static readonly string[] FallbackSymbolicLinks = new[]
-        {
-            @"\\.\MagicMouse",
-            @"\\.\MagicMouseRawPDO",
-            @"\\.\GLOBALROOT\Device\MagicMouseRawPDO",
-        };
+        public string OpenedPath => _openedPath;
 
         // ---------- Public API ----------
+        /// <summary>
+        /// Run device discovery and return a human-readable report of what was found.
+        /// Useful for diagnostics when scroll doesn't work.
+        /// </summary>
+        public string BuildDiagnostics()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== Magic Mouse device discovery ===");
+            sb.AppendLine();
+
+            var pdo = EnumerateMagicMousePdoPaths();
+            sb.AppendLine($"[1] PDO/interface candidates with service=MagicMouse*: {pdo.Count}");
+            foreach (var c in pdo)
+                sb.AppendLine($"    - {c.Description}");
+            if (pdo.Count == 0)
+                sb.AppendLine("    (none - is MagicMouse.sys installed and the mouse paired?)");
+            sb.AppendLine();
+
+            var hid = EnumerateAppleHidPaths();
+            sb.AppendLine($"[2] Apple HID interfaces (VID_05AC): {hid.Count}");
+            foreach (var p in hid)
+                sb.AppendLine($"    - {Truncate(p, 100)}");
+            if (hid.Count == 0)
+                sb.AppendLine("    (none - is the mouse connected via Bluetooth?)");
+            sb.AppendLine();
+
+            sb.AppendLine($"[3] Currently opened path: {(_openedPath.Length == 0 ? "(none)" : _openedPath)}");
+            sb.AppendLine($"    Report length: {_reportLen} bytes");
+            sb.AppendLine();
+            sb.AppendLine("Tips if scroll doesn't work:");
+            sb.AppendLine("  - Run 'sc query MagicMouse' in PowerShell - it should be RUNNING.");
+            sb.AppendLine("  - Pair the mouse via Bluetooth before launching this app.");
+            sb.AppendLine("  - If [1] is empty but [2] has Apple devices, the driver isn't bound");
+            sb.AppendLine("    to the device - reinstall it via 'pnputil /add-driver MagicMouse.inf /install'.");
+
+            return sb.ToString();
+        }
+
         public bool Open()
         {
-            // 1) Robust HID enumeration (works on Win10 and Win11)
-            var candidates = EnumerateHidCandidates();
-
-            // Prefer Apple devices first
-            candidates.Sort((a, b) =>
+            // Strategy 1: find the device whose driver service is "MagicMouse",
+            // then open its raw PDO via "\\.\GLOBALROOT\Device\<pdo-name>".
+            // This is the path the Magic Utilities driver actually exposes.
+            foreach (var pdoCandidate in EnumerateMagicMousePdoPaths())
             {
-                int sa = a.IsAppleDevice ? 0 : 1;
-                int sb = b.IsAppleDevice ? 0 : 1;
-                if (sa != sb) return sa - sb;
-                // longer InputReport length usually means richer data (raw touch interface)
-                return b.InputReportByteLength.CompareTo(a.InputReportByteLength);
-            });
-
-            foreach (var c in candidates)
-            {
-                if (TryOpen(c.Path))
+                if (TryOpen(pdoCandidate.Path))
                 {
-                    StatusChanged?.Invoke($"Connected: VID={c.Vid:X4} PID={c.Pid:X4} report={_reportLen}b");
+                    StatusChanged?.Invoke(
+                        $"Connected: {pdoCandidate.Description} (report={_reportLen}b)");
                     return true;
                 }
             }
 
-            // 2) Fallback to well-known symbolic links (older Magic Utilities builds)
+            // Strategy 2: HID enumeration filtered by Apple VID (handles BootCamp-style
+            // setups where the device shows up as a regular HID mouse).
+            foreach (var hid in EnumerateAppleHidPaths())
+            {
+                if (TryOpen(hid))
+                {
+                    StatusChanged?.Invoke($"Connected via HID: {Truncate(hid, 60)} (report={_reportLen}b)");
+                    return true;
+                }
+            }
+
+            // Strategy 3: well-known DOS names (older driver versions exposed these).
             foreach (var path in FallbackSymbolicLinks)
             {
                 if (TryOpen(path))
@@ -174,7 +252,9 @@ namespace MagicMouseApp
                 }
             }
 
-            StatusChanged?.Invoke("Magic Mouse not found - check Bluetooth + driver");
+            StatusChanged?.Invoke(
+                "Magic Mouse driver not found. Is the MagicMouse service running? " +
+                "Run 'sc query MagicMouse' in PowerShell to verify.");
             return false;
         }
 
@@ -195,9 +275,7 @@ namespace MagicMouseApp
             try
             {
                 if (_handle is { IsInvalid: false, IsClosed: false })
-                {
                     CancelIoEx(_handle, IntPtr.Zero);
-                }
             }
             catch { /* ignore */ }
             try { _handle?.Close(); } catch { }
@@ -206,7 +284,7 @@ namespace MagicMouseApp
 
         public void Dispose() => Stop();
 
-        // ---------- Internals ----------
+        // ---------- Internals: opening ----------
         private bool TryOpen(string path)
         {
             try
@@ -228,20 +306,14 @@ namespace MagicMouseApp
 
                 _handle = h;
                 _openedPath = path;
+                _reportLen = 64; // default; updated below if HID
 
-                // Probe HID caps to figure out report length (raw devices may not be HID)
+                // If this happens to be a HID interface, query its caps.
                 if (HidD_GetPreparsedData(_handle, out var preparsed))
                 {
                     if (HidP_GetCaps(preparsed, out var caps) >= 0 && caps.InputReportByteLength > 0)
-                    {
                         _reportLen = caps.InputReportByteLength;
-                    }
                     HidD_FreePreparsedData(preparsed);
-                }
-                else
-                {
-                    // Custom raw device - use a generous buffer
-                    _reportLen = 64;
                 }
 
                 return true;
@@ -252,62 +324,72 @@ namespace MagicMouseApp
             }
         }
 
-        private struct HidCandidate
+        // ---------- Internals: PDO enumeration by service name ----------
+        private struct PdoCandidate
         {
-            public string Path;
-            public ushort Vid;
-            public ushort Pid;
-            public int InputReportByteLength;
-            public bool IsAppleDevice;
+            public string Path;          // e.g. \\.\GLOBALROOT\Device\00000416
+            public string Description;   // human-readable for status text
         }
 
-        private List<HidCandidate> EnumerateHidCandidates()
+        private List<PdoCandidate> EnumerateMagicMousePdoPaths()
         {
-            var list = new List<HidCandidate>();
-            HidD_GetHidGuid(out var hidGuid);
+            var result = new List<PdoCandidate>();
 
-            IntPtr devSet = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero,
-                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            // ALLCLASSES + PRESENT lists every device currently in the PnP tree
+            // regardless of setup class. We then filter by driver service name.
+            IntPtr devSet = SetupDiGetClassDevs(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                DIGCF_PRESENT | DIGCF_ALLCLASSES);
 
-            if (devSet == IntPtr.Zero || devSet == new IntPtr(-1))
-                return list;
+            if (devSet == IntPtr.Zero || devSet == new IntPtr(-1)) return result;
 
             try
             {
-                uint index = 0;
-                while (true)
+                var devInfo = new SP_DEVINFO_DATA();
+                devInfo.cbSize = Marshal.SizeOf<SP_DEVINFO_DATA>();
+
+                for (uint idx = 0; SetupDiEnumDeviceInfo(devSet, idx, ref devInfo); idx++)
                 {
-                    var ifaceData = new SP_DEVICE_INTERFACE_DATA();
-                    ifaceData.cbSize = Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>();
+                    string service = ReadProp(devSet, ref devInfo, SPDRP_SERVICE) ?? "";
+                    if (string.IsNullOrEmpty(service)) continue;
 
-                    if (!SetupDiEnumDeviceInterfaces(devSet, IntPtr.Zero, ref hidGuid, index, ref ifaceData))
-                        break;
-                    index++;
-
-                    SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, IntPtr.Zero, 0, out uint reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
-
-                    IntPtr detail = Marshal.AllocHGlobal((int)reqSize);
-                    try
+                    bool isMagic = false;
+                    foreach (var s in MagicMouseServiceNames)
                     {
-                        // SP_DEVICE_INTERFACE_DETAIL_DATA cbSize is 8 on x64 (4-byte int + 4-byte alignment for the
-                        // first wide char), and 6 on x86. Using IntPtr.Size + 4 covers both safely.
-                        Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
-
-                        if (!SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, detail, reqSize, out _, IntPtr.Zero))
-                            continue;
-
-                        // DevicePath starts after the cbSize field
-                        IntPtr pathPtr = IntPtr.Add(detail, 4);
-                        string? path = Marshal.PtrToStringAuto(pathPtr);
-                        if (string.IsNullOrEmpty(path)) continue;
-
-                        var cand = ProbeCandidate(path);
-                        if (cand.HasValue) list.Add(cand.Value);
+                        if (service.Equals(s, StringComparison.OrdinalIgnoreCase))
+                        {
+                            isMagic = true;
+                            break;
+                        }
                     }
-                    finally
+                    if (!isMagic) continue;
+
+                    string desc    = ReadProp(devSet, ref devInfo, SPDRP_FRIENDLYNAME)
+                                  ?? ReadProp(devSet, ref devInfo, SPDRP_DEVICEDESC)
+                                  ?? "MagicMouse";
+                    string pdoName = ReadProp(devSet, ref devInfo, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME) ?? "";
+
+                    // pdoName looks like "\Device\00000416". Translate to a Win32 path:
+                    if (!string.IsNullOrEmpty(pdoName))
                     {
-                        Marshal.FreeHGlobal(detail);
+                        result.Add(new PdoCandidate
+                        {
+                            Path = @"\\.\GLOBALROOT" + pdoName,
+                            Description = $"{desc} svc={service} pdo={pdoName}"
+                        });
+                    }
+
+                    // Bonus: also list every device-interface this device exposes,
+                    // by trying the well-known interface GUIDs.
+                    foreach (var ifaceGuid in WellKnownInterfaceGuids())
+                    {
+                        foreach (var ifacePath in EnumerateInterfacesForDevice(devSet, ref devInfo, ifaceGuid))
+                        {
+                            result.Add(new PdoCandidate
+                            {
+                                Path = ifacePath,
+                                Description = $"{desc} iface={Truncate(ifacePath, 50)}"
+                            });
+                        }
                     }
                 }
             }
@@ -316,108 +398,139 @@ namespace MagicMouseApp
                 SetupDiDestroyDeviceInfoList(devSet);
             }
 
-            return list;
+            return result;
         }
 
-        private HidCandidate? ProbeCandidate(string path)
+        private static IEnumerable<Guid> WellKnownInterfaceGuids()
         {
-            // Lightweight probe: open, query attributes & caps, then close.
-            var h = CreateFile(path,
-                0, // no access - just identify
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            // GUID_DEVINTERFACE_HID
+            yield return new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
+            // GUID_DEVINTERFACE_MOUSE
+            yield return new Guid("378DE44C-56EF-11D1-BC8C-00A0C91405DD");
+        }
 
-            if (h is null || h.IsInvalid)
+        private static IEnumerable<string> EnumerateInterfacesForDevice(IntPtr devSet,
+            ref SP_DEVINFO_DATA devInfo, Guid ifaceGuid)
+        {
+            // We can't pass devInfo by ref into an iterator method, so collect first.
+            var paths = new List<string>();
+            var ifaceData = new SP_DEVICE_INTERFACE_DATA
             {
-                // Some interfaces refuse zero-access opens; fall back to read share
-                h = CreateFile(path,
-                    GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
-            }
+                cbSize = Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>()
+            };
 
-            if (h is null || h.IsInvalid)
-            {
-                // Even if probe fails, the path may still be openable later via the main path.
-                // Use VID heuristic from the path string itself.
-                return PathHeuristic(path);
-            }
-
-            ushort vid = 0, pid = 0;
-            int inputLen = 0;
-
+            // Pin devInfo on the stack of caller; SetupDiEnumDeviceInterfaces needs the
+            // address of SP_DEVINFO_DATA, so we use a helper P/Invoke overload that
+            // accepts ref devInfo. Here we copy into a managed pointer.
+            IntPtr devInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<SP_DEVINFO_DATA>());
             try
             {
-                var attrs = new HIDD_ATTRIBUTES { Size = Marshal.SizeOf<HIDD_ATTRIBUTES>() };
-                if (HidD_GetAttributes(h, ref attrs))
-                {
-                    vid = attrs.VendorID;
-                    pid = attrs.ProductID;
-                }
+                Marshal.StructureToPtr(devInfo, devInfoPtr, false);
 
-                if (HidD_GetPreparsedData(h, out var pp))
+                for (uint i = 0; SetupDiEnumDeviceInterfaces(devSet, devInfoPtr, ref ifaceGuid, i, ref ifaceData); i++)
                 {
-                    if (HidP_GetCaps(pp, out var caps) >= 0)
-                        inputLen = caps.InputReportByteLength;
-                    HidD_FreePreparsedData(pp);
+                    SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, IntPtr.Zero, 0, out uint reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr detail = Marshal.AllocHGlobal((int)reqSize);
+                    try
+                    {
+                        Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
+                        if (SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, detail, reqSize, out _, IntPtr.Zero))
+                        {
+                            string? p = Marshal.PtrToStringAuto(IntPtr.Add(detail, 4));
+                            if (!string.IsNullOrEmpty(p)) paths.Add(p);
+                        }
+                    }
+                    finally { Marshal.FreeHGlobal(detail); }
                 }
             }
             finally
             {
-                h.Close();
+                Marshal.FreeHGlobal(devInfoPtr);
             }
 
-            bool isApple = vid == APPLE_VID;
-            bool isMagicMouse = isApple && Array.IndexOf(MagicMousePids, pid) >= 0;
-
-            // Heuristic by string when HID metadata is unavailable
-            if (vid == 0)
-            {
-                var heur = PathHeuristic(path);
-                if (heur.HasValue) return heur;
-                return null;
-            }
-
-            // Skip non-Apple HID devices to keep enumeration tight (but keep magic-mouse named devices)
-            if (!isApple && !path.Contains("magicmouse", StringComparison.OrdinalIgnoreCase))
-                return null;
-
-            return new HidCandidate
-            {
-                Path = path,
-                Vid = vid,
-                Pid = pid,
-                InputReportByteLength = inputLen,
-                IsAppleDevice = isMagicMouse || isApple
-            };
+            return paths;
         }
 
-        private static HidCandidate? PathHeuristic(string path)
+        private static string? ReadProp(IntPtr devSet, ref SP_DEVINFO_DATA devInfo, uint property)
+        {
+            // First call to learn required size
+            SetupDiGetDeviceRegistryProperty(devSet, ref devInfo, property, out _,
+                IntPtr.Zero, 0, out uint reqSize);
+            if (reqSize == 0) return null;
+
+            IntPtr buf = Marshal.AllocHGlobal((int)reqSize);
+            try
+            {
+                if (!SetupDiGetDeviceRegistryProperty(devSet, ref devInfo, property, out _,
+                        buf, reqSize, out _))
+                    return null;
+                return Marshal.PtrToStringAuto(buf);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+
+        // ---------- Internals: HID fallback by VID ----------
+        private List<string> EnumerateAppleHidPaths()
+        {
+            var paths = new List<string>();
+            HidD_GetHidGuid(out var hidGuid);
+
+            IntPtr devSet = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero,
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (devSet == IntPtr.Zero || devSet == new IntPtr(-1)) return paths;
+
+            try
+            {
+                var ifaceData = new SP_DEVICE_INTERFACE_DATA
+                {
+                    cbSize = Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>()
+                };
+
+                for (uint i = 0;
+                    SetupDiEnumDeviceInterfaces(devSet, IntPtr.Zero, ref hidGuid, i, ref ifaceData);
+                    i++)
+                {
+                    SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, IntPtr.Zero, 0, out uint reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr detail = Marshal.AllocHGlobal((int)reqSize);
+                    try
+                    {
+                        Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
+                        if (!SetupDiGetDeviceInterfaceDetail(devSet, ref ifaceData, detail, reqSize, out _, IntPtr.Zero))
+                            continue;
+
+                        string? path = Marshal.PtrToStringAuto(IntPtr.Add(detail, 4));
+                        if (string.IsNullOrEmpty(path)) continue;
+
+                        if (LooksLikeMagicMouseHid(path))
+                            paths.Add(path);
+                    }
+                    finally { Marshal.FreeHGlobal(detail); }
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(devSet);
+            }
+
+            return paths;
+        }
+
+        private static bool LooksLikeMagicMouseHid(string path)
         {
             string lower = path.ToLowerInvariant();
-            bool looksApple = lower.Contains("vid_05ac") || lower.Contains("magicmouse");
-            if (!looksApple) return null;
-
-            ushort vid = 0, pid = 0;
-            int idx = lower.IndexOf("vid_", StringComparison.Ordinal);
-            if (idx >= 0 && lower.Length >= idx + 8)
-                ushort.TryParse(lower.Substring(idx + 4, 4), System.Globalization.NumberStyles.HexNumber,
-                    System.Globalization.CultureInfo.InvariantCulture, out vid);
-            int pidx = lower.IndexOf("pid_", StringComparison.Ordinal);
-            if (pidx >= 0 && lower.Length >= pidx + 8)
-                ushort.TryParse(lower.Substring(pidx + 4, 4), System.Globalization.NumberStyles.HexNumber,
-                    System.Globalization.CultureInfo.InvariantCulture, out pid);
-
-            return new HidCandidate
-            {
-                Path = path,
-                Vid = vid,
-                Pid = pid,
-                InputReportByteLength = 0,
-                IsAppleDevice = true
-            };
+            if (lower.Contains("magicmouse")) return true;
+            if (lower.Contains("vid_05ac")) return true; // Apple
+            return false;
         }
 
+        // ---------- Read loop ----------
         private void ReadLoop()
         {
             int bufSize = Math.Max(_reportLen, 64);
@@ -469,5 +582,8 @@ namespace MagicMouseApp
                 Raw = raw
             };
         }
+
+        private static string Truncate(string s, int max)
+            => string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "...";
     }
 }
