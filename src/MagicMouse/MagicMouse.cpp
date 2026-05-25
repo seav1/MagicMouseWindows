@@ -254,17 +254,6 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
         }
     }
 
-    // Pass 2: fallback to any candidate PDO (covers edge cases where service/provider text
-    // still looks Microsoft but PDO path is usable).
-    for (int i = 0; i < n; i++) {
-        if (!arr[i].hasPdo) continue;
-        HANDLE h = TryOpenPath(arr[i].pdoPath);
-        if (h) {
-            StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), arr[i].pdoPath);
-            return h;
-        }
-    }
-
     return NULL;
 }
 
@@ -536,6 +525,22 @@ static int RunDriverInstallElevated(void)
     int bound = 0, cands = 0;
     HANDLE h = OpenMagicMouse(&bound, &cands);
     if (h) CloseHandle(h);
+
+    // If still not bound, do a targeted re-enumeration ONLY for detected
+    // Magic Mouse instance IDs (safe for keyboard/headset). This is the
+    // last resort that often fixes "driver in store but still Microsoft".
+    if (bound == 0 && n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (!arr[i].instanceId[0]) continue;
+            StringCchPrintfW(cmd, _countof(cmd),
+                L"pnputil.exe /remove-device \"%s\"", arr[i].instanceId);
+            RunWait(cmd);
+        }
+        RunWait(L"pnputil.exe /scan-devices");
+        Sleep(1500);
+        h = OpenMagicMouse(&bound, &cands);
+        if (h) CloseHandle(h);
+    }
     BOOL svcOk = IsServiceInstalled(L"MagicMouse");
     RemoveTempDir(dir);
 
@@ -622,17 +627,26 @@ static void RelaunchInstallerElevated(void)
 static AppState QueryState(int* outCandidates, int* outBound)
 {
     if (g_dev) {
-        if (outCandidates) *outCandidates = 1;
-        if (outBound) *outBound = 1;
-        return ST_CONNECTED;
+        int b = 0, c = 0;
+        HANDLE h = OpenMagicMouse(&b, &c);
+        if (h) CloseHandle(h);
+        if (outCandidates) *outCandidates = c;
+        if (outBound) *outBound = b;
+        if (b > 0) return ST_CONNECTED;
+        if (!IsServiceInstalled(L"MagicMouse")) return ST_DRIVER_MISSING;
+        if (c > 0) return ST_DRIVER_MISMATCH;
+        return ST_NOT_PAIRED;
     }
     int bound = 0, cands = 0;
     HANDLE h = OpenMagicMouse(&bound, &cands);
     if (h) {
         CloseHandle(h);
         if (outCandidates) *outCandidates = cands;
-        if (outBound) *outBound = bound > 0 ? bound : 1;
-        return ST_CONNECTED;
+        if (outBound) *outBound = bound;
+        if (bound > 0) return ST_CONNECTED;
+        if (!IsServiceInstalled(L"MagicMouse")) return ST_DRIVER_MISSING;
+        if (cands > 0) return ST_DRIVER_MISMATCH;
+        return ST_NOT_PAIRED;
     }
     if (outCandidates) *outCandidates = cands;
     if (outBound) *outBound = bound;
