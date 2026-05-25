@@ -21,6 +21,21 @@ jobs:
         with:
           arch: x64
 
+      - name: Verify embedded driver files are present
+        shell: pwsh
+        working-directory: src\MagicMouse
+        run: |
+          $missing = @()
+          foreach ($f in 'drivers/MagicMouse.inf','drivers/MagicMouse.sys','drivers/MagicMouse.cat') {
+            if (-not (Test-Path $f)) { $missing += $f }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing driver files: $($missing -join ', ')"
+            Write-Error "These must be committed to git, otherwise the rc.exe step fails with RC2135."
+            exit 1
+          }
+          Get-ChildItem drivers | Format-Table Name,Length -AutoSize
+
       - name: Compile MagicMouse.exe
         shell: cmd
         working-directory: src\MagicMouse
@@ -32,7 +47,7 @@ jobs:
              /Fe:build\MagicMouse.exe /Fo:build\ ^
              MagicMouse.cpp build\MagicMouse.res ^
              /link /SUBSYSTEM:WINDOWS ^
-             setupapi.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib kernel32.lib
+             setupapi.lib newdev.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib kernel32.lib
 
       - name: Verify artifact
         shell: pwsh
@@ -58,15 +73,15 @@ jobs:
           body: |
             ## Magic Mouse Windows ${{ github.ref_name }}
 
-            Native Win32 build (no .NET runtime required).
+            Native Win32 build, no .NET / runtime required. The Magic Mouse
+            kernel driver is embedded inside the .exe and auto-installed on
+            first run (you'll see one UAC prompt).
 
-            **Compatible with**: Windows 10 (1607+) and Windows 11, x64.
-            **Size**: ~150 KB single .exe.
+            **Compatible with:** Windows 10 (1607+) and Windows 11, x64.
+            **Size:** ~6.5 MB single `.exe` (driver bundled).
 
-            ### Installation
-            See [README](https://github.com/seav1/MagicMouseWindows#-quick-start) for full setup instructions.
-
-            ### Download
-            Download `MagicMouse.exe` below and run it directly - no installation needed.
+            Just download `MagicMouse.exe` and run it. See the
+            [README](https://github.com/seav1/MagicMouseWindows#quick-start)
+            for details.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
