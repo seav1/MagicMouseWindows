@@ -35,11 +35,13 @@
 
 #include <windows.h>
 #include <setupapi.h>
+#include <newdev.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <strsafe.h>
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "newdev.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -73,6 +75,20 @@ static const int     kSpeedPresets[] = { 10, 20, 30, 50, 80, 100 };
 static const wchar_t* kSpeedNames[]  = {
     L"1.0x  (slow)", L"2.0x", L"3.0x  (default)",
     L"5.0x", L"8.0x", L"10.0x (fastest)"
+};
+
+// Exact hardware IDs listed in MagicMouse.inf [MagicUtilities.NTamd64].
+// We feed every entry to UpdateDriverForPlugAndPlayDevicesW, which finds
+// matching devices and atomically switches their driver to MagicMouse.sys
+// without disturbing any other Bluetooth/USB device.
+static const wchar_t* kMouseHwids[] = {
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&030d", // Magic Mouse 2009 BT
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&000205ac_PID&0310", // Magic Mouse 2009 BT (alt)
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0269", // Magic Mouse 2 (2015) BT
+    L"USB\\Vid_05ac&Pid_0269&MI_01",                                          // Magic Mouse 2 (2015) USB
+    L"BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&0001004c_PID&0323", // Magic Mouse 3 (2024) BT
+    L"USB\\Vid_05ac&Pid_0323&MI_01",                                          // Magic Mouse 3 (2024) USB
+    NULL
 };
 
 // ---------------------------------------------------------------------------
@@ -204,39 +220,41 @@ static HANDLE OpenMagicMouse(int* outBound)
     return result;
 }
 
-// Tests whether a wide-char hardware ID buffer contains "05ac" or "004c"
-// (USB-IF Apple VID, Bluetooth-SIG Apple VID). Case-insensitive.
-static BOOL HwidLooksApple(const wchar_t* p, DWORD n)
-{
-    for (DWORD k = 0; k + 3 < n; k++) {
-        wchar_t c2 = p[k+2] | 0x20;
-        wchar_t c3 = p[k+3] | 0x20;
-        if (p[k] == L'0' && p[k+1] == L'5' && c2 == L'a' && c3 == L'c') return TRUE;
-        if (p[k] == L'0' && p[k+1] == L'0' && p[k+2] == L'4' && c3 == L'c') return TRUE;
-    }
-    return FALSE;
-}
-
-// Counts devices whose hardware ID contains an Apple VID. Used to decide
-// whether to offer driver install (vs the mouse simply not being paired).
-static int CountAppleDevices(void)
+// Returns TRUE if at least one currently-present device matches a hardware
+// ID listed in our INF (i.e. there is a Magic Mouse Windows might bind to).
+// We consult the device's full HardwareIDs list and require an exact match,
+// so e.g. a Magic Keyboard or AirPods will NEVER count as "a magic mouse".
+static BOOL IsAnyMagicMousePresent(void)
 {
     HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
         DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (ds == INVALID_HANDLE_VALUE) return 0;
+    if (ds == INVALID_HANDLE_VALUE) return FALSE;
 
+    BOOL found = FALSE;
     SP_DEVINFO_DATA d = { sizeof(d) };
-    BYTE buf[2048];
-    int count = 0;
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
+    BYTE buf[4096];
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d) && !found; i++) {
         DWORD got = 0;
         if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
                 buf, sizeof(buf), &got) || got < 4)
             continue;
-        if (HwidLooksApple((wchar_t*)buf, got / sizeof(wchar_t))) count++;
+
+        // SPDRP_HARDWAREID returns a REG_MULTI_SZ - walk each NUL-terminated
+        // string and compare against our whitelist.
+        const wchar_t* p = (const wchar_t*)buf;
+        DWORD remain = got / sizeof(wchar_t);
+        while (remain > 0 && *p) {
+            size_t len = wcslen(p);
+            for (int k = 0; kMouseHwids[k] && !found; k++) {
+                if (_wcsicmp(p, kMouseHwids[k]) == 0) { found = TRUE; break; }
+            }
+            if (len + 1 > remain) break;
+            p      += len + 1;
+            remain -= (DWORD)(len + 1);
+        }
     }
     SetupDiDestroyDeviceInfoList(ds);
-    return count;
+    return found;
 }
 
 // ===========================================================================
@@ -432,8 +450,24 @@ static BOOL IsServiceInstalled(const wchar_t* name)
     return found;
 }
 
-// ELEVATED entry point: extract embedded driver, add to store, force PnP
-// to re-evaluate any Apple devices already enumerated, then verify.
+// ELEVATED entry point.
+//
+// Steps:
+//   1. Extract the three embedded driver files to %TEMP%.
+//   2. `pnputil /add-driver MagicMouse.inf /install` - registers the INF in
+//      the driver store so future device arrivals find it.
+//   3. For every hardware ID listed in the INF, ask Windows to update the
+//      driver of any *currently present* matching device to MagicMouse.sys
+//      via UpdateDriverForPlugAndPlayDevicesW. INSTALLFLAG_FORCE makes it
+//      override Windows' built-in HID driver even when Windows considered
+//      that driver "already good enough".
+//   4. Verify and report.
+//
+// IMPORTANT: We deliberately do NOT call `pnputil /remove-device` on
+// anything. The previous version of this code did, and it could blow away
+// other Bluetooth devices (Apple Magic Keyboard, AirPods etc) because
+// detection was VID-based. UpdateDriverForPlugAndPlayDevicesW is precise:
+// it touches exactly the PIDs we list, nothing else.
 static int RunDriverInstallElevated(void)
 {
     wchar_t dir[MAX_PATH];
@@ -445,45 +479,36 @@ static int RunDriverInstallElevated(void)
         return 1;
     }
 
-    // 1) pnputil /add-driver <inf> /install  - registers the INF and binds
-    //    it to any matching device that is currently UN-driven.
+    wchar_t infPath[MAX_PATH];
+    StringCchPrintfW(infPath, MAX_PATH, L"%s\\MagicMouse.inf", dir);
+
+    // Step 1: register INF in the driver store.
     wchar_t cmd[1024];
     StringCchPrintfW(cmd, 1024,
-        L"pnputil.exe /add-driver \"%s\\MagicMouse.inf\" /install", dir);
+        L"pnputil.exe /add-driver \"%s\" /install", infPath);
     DWORD rcAdd = RunWait(cmd);
 
-    // 2) Force-rebind: for every Apple-VID device currently bound to a
-    //    different driver, remove the instance so PnP re-picks one.
-    int removed = 0;
-    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (ds != INVALID_HANDLE_VALUE) {
-        SP_DEVINFO_DATA d = { sizeof(d) };
-        BYTE hwbuf[2048];
-        for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
-            DWORD got = 0;
-            if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID,
-                    NULL, hwbuf, sizeof(hwbuf), &got) || got < 4)
-                continue;
-            if (!HwidLooksApple((wchar_t*)hwbuf, got / sizeof(wchar_t)))
-                continue;
-
-            wchar_t instId[256] = { 0 };
-            if (!SetupDiGetDeviceInstanceIdW(ds, &d, instId, _countof(instId), NULL))
-                continue;
-
-            StringCchPrintfW(cmd, 1024,
-                L"pnputil.exe /remove-device \"%s\"", instId);
-            if (RunWait(cmd) == 0) removed++;
+    // Step 2: per-hwid driver swap. Each call only touches devices whose
+    // hardware-ID list contains an exact match, so e.g. an Apple Magic
+    // Keyboard (different PID) will be left completely alone.
+    int updated = 0;
+    int triedHwid = 0;
+    BOOL anyReboot = FALSE;
+    for (int i = 0; kMouseHwids[i]; i++) {
+        triedHwid++;
+        BOOL reboot = FALSE;
+        if (UpdateDriverForPlugAndPlayDevicesW(NULL, kMouseHwids[i], infPath,
+                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &reboot)) {
+            updated++;
+            if (reboot) anyReboot = TRUE;
         }
-        SetupDiDestroyDeviceInfoList(ds);
+        // ERROR_NO_SUCH_DEVINST etc. just means "no matching device present
+        // right now"; that's fine - we just continue.
     }
 
-    // 3) Bus rescan: resurrect the just-removed instances under the new INF.
-    RunWait(L"pnputil.exe /scan-devices");
-    Sleep(2000);
+    Sleep(800);
 
-    // Verify
+    // Step 3: verify.
     int bound = 0;
     HANDLE check = OpenMagicMouse(&bound);
     if (check) CloseHandle(check);
@@ -493,8 +518,12 @@ static int RunDriverInstallElevated(void)
 
     if (bound > 0) {
         MessageBoxW(NULL,
-            L"Driver installed and bound to your Magic Mouse.\r\n"
-            L"Close this dialog; the tray app will resume automatically.",
+            anyReboot
+              ? L"Driver installed and bound to your Magic Mouse.\r\n"
+                L"Windows is asking for a reboot to finalize - reboot when\r\n"
+                L"convenient. Scrolling will work after this dialog closes."
+              : L"Driver installed and bound to your Magic Mouse.\r\n"
+                L"Close this dialog; the tray app will resume automatically.",
             L"Magic Mouse - Install OK", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -505,33 +534,31 @@ static int RunDriverInstallElevated(void)
             L"Failed to register the driver with Windows.\r\n\r\n"
             L"pnputil exit code: %lu\r\n\r\n"
             L"Make sure you accepted the UAC prompt and that no other Magic\r\n"
-            L"Mouse driver (e.g. Magic Utilities) is currently installed.",
+            L"Mouse driver (e.g. the official Magic Utilities) is installed.",
             rcAdd);
         MessageBoxW(NULL, msg, L"Magic Mouse - Install error",
             MB_OK | MB_ICONERROR);
         return 2;
     }
 
-    // Driver is in the store but no device is currently bound to it.
-    // The most common cause is a paired-but-bound-to-Microsoft-HID Bluetooth
-    // mouse: PnP won't auto-switch drivers for an already-known BT device
-    // until the device is unpaired and re-paired.
+    // Driver is in the store but UpdateDriverForPlugAndPlayDevicesW didn't
+    // match anything (or matched but PnP hasn't finished re-binding yet).
     wchar_t msg[1024];
     StringCchPrintfW(msg, _countof(msg),
-        L"The Magic Mouse driver is now installed in Windows, but no\r\n"
-        L"Magic Mouse is bound to it yet (instances re-scanned: %d).\r\n\r\n"
-        L"How to finish:\r\n\r\n"
-        L"   1.  Open  Settings -> Bluetooth & devices.\r\n"
-        L"   2.  Find your Magic Mouse, click the [...] menu, choose\r\n"
-        L"       \"Remove device\" / \"Forget\".\r\n"
-        L"   3.  Click \"Add device\" -> \"Bluetooth\" and pair the mouse\r\n"
-        L"       again.\r\n"
-        L"   4.  Click \"Reconnect\" in the tray menu.\r\n\r\n"
-        L"(If the mouse is plugged in via USB / USB-C cable, just unplug\r\n"
-        L"and re-plug it instead. A reboot also works.)",
-        removed);
+        L"The Magic Mouse driver is registered, but no Magic Mouse is\r\n"
+        L"currently bound to it (devices updated: %d / %d hardware IDs).\r\n\r\n"
+        L"What to try:\r\n\r\n"
+        L"  1. Make sure the mouse is paired and turned on, then click\r\n"
+        L"     \"Reconnect\" in the tray menu.\r\n"
+        L"  2. If that doesn't help, open Settings -> Bluetooth & devices,\r\n"
+        L"     remove the Magic Mouse, then pair it again. The new driver\r\n"
+        L"     will bind on first connection.\r\n"
+        L"  3. As a last resort, reboot Windows.\r\n\r\n"
+        L"Other Bluetooth devices (keyboard, headphones, ...) are NOT\r\n"
+        L"affected - this installer only touches the Magic Mouse PIDs.",
+        updated, triedHwid);
     MessageBoxW(NULL, msg,
-        L"Magic Mouse - Driver added, please re-pair the mouse",
+        L"Magic Mouse - Driver registered, no mouse bound",
         MB_OK | MB_ICONINFORMATION);
     return 0;
 }
@@ -594,8 +621,9 @@ static void OfferDriverInstall(BOOL forceAsk)
     int boundCount = 0;
     HANDLE h = OpenMagicMouse(&boundCount);
     if (h) CloseHandle(h);
-    int  appleCount = CountAppleDevices();
+
     BOOL serviceOk  = IsServiceInstalled(L"MagicMouse");
+    BOOL mousePresent = IsAnyMagicMousePresent();
 
     const wchar_t* msg = NULL;
     if (boundCount > 0) {
@@ -607,21 +635,23 @@ static void OfferDriverInstall(BOOL forceAsk)
         msg = L"The Magic Mouse driver isn't installed on this PC yet.\r\n\r\n"
               L"Install the bundled driver now?\r\n"
               L"Windows will ask for administrator approval once.";
-    } else if (appleCount == 0) {
-        // Driver is in the store but no Apple device is paired/connected.
-        // Don't nag on every launch - only ask if the user explicitly chose
-        // \"Reinstall driver...\".
+    } else if (!mousePresent) {
+        // Driver installed but no compatible Magic Mouse is paired.
         if (!forceAsk) return;
         msg = L"The driver is already installed, but no Magic Mouse is\r\n"
-              L"currently paired/connected. Pair the mouse first, then click\r\n"
-              L"\"Reconnect\" in the tray menu.\r\n\r\n"
+              L"currently paired with this PC. Pair the mouse via\r\n"
+              L"Settings -> Bluetooth & devices, then click \"Reconnect\".\r\n\r\n"
               L"Run the installer anyway?";
     } else {
-        // Driver in store, Apple device present, but not bound. Common case
-        // when Windows preferred its built-in HID stack.
-        msg = L"The driver is installed but not bound to your Magic Mouse.\r\n\r\n"
-              L"Try to fix it now?\r\n"
-              L"Windows will ask for administrator approval once.";
+        // The mouse IS visible to Windows, but bound to a different driver
+        // (typically Microsoft's built-in HID stack).
+        msg = L"Your Magic Mouse is detected, but it's currently using\r\n"
+              L"Windows' default driver instead of MagicMouse.sys, so\r\n"
+              L"two-finger scrolling doesn't work yet.\r\n\r\n"
+              L"Switch to the bundled driver now?\r\n"
+              L"Windows will ask for administrator approval once.\r\n\r\n"
+              L"(Only your Magic Mouse will be touched - Bluetooth keyboard,\r\n"
+              L"AirPods and other devices are not affected.)";
     }
 
     int r = MessageBoxW(NULL, msg, L"Magic Mouse - Driver setup",

@@ -50,7 +50,7 @@ cl /nologo /O2 /MT /EHsc /W3 /GS- ^
    /Fobuild\ /Fdbuild\ ^
    MagicMouse.cpp build\MagicMouse.res ^
    /link /SUBSYSTEM:WINDOWS /OUT:build\MagicMouse.exe ^
-   setupapi.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib kernel32.lib || exit /b 1
+   setupapi.lib newdev.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib kernel32.lib || exit /b 1
 
 echo.
 echo [build.cmd] Built: %~dp0build\MagicMouse.exe
