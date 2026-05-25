@@ -45,24 +45,39 @@
 |---|---|
 | 托盘显示"未连接" | 鼠标是否已配对并打开？点 **Reconnect** |
 | 首次 UAC 点了"否" | 右键托盘 → **Reinstall driver…** |
-| 指针能动，就是滚不动 | 见下面"驱动装上但鼠标没绑定"那一节 |
+| 指针能动，就是滚不动 | **Reinstall driver…** —— 安装器只会切换 Magic Mouse 那几个 PID（0269 / 0323 / 030d / 0310）的驱动，**不会影响**蓝牙键盘、AirPods 等其他设备 |
 | 昨天还行，今天 Windows 更新后挂了 | 跟上面一样，Windows 偶尔会把驱动切回自带 HID |
 | 同时连了多个 Magic Mouse | 只会打开第一个绑定到 `MagicMouse` 服务的设备 |
+
+万一上面都没用：到 **设置 → 蓝牙和设备**，把 Magic Mouse 删了再重新配对，
+新连接进来时会自动绑到我们注册的驱动上。
 
 如果你想直接用官方付费版，请卸载本程序后到
 [Magic Utilities](https://magicutilities.net/) 下载安装。
 
-### "驱动装上了，但鼠标没绑定"
+### 之前的版本把蓝牙键盘 / 鼠标搞成感叹号了？
 
-程序会跑 `pnputil /add-driver /install`，再把已枚举的 Apple-VID 设备
-逐个 `/remove-device` + `/scan-devices`。但对**已经配过对**的蓝牙鼠标，
-Windows 不会从 `hidbth` 切到 `MagicMouse`，必须**手动取消配对再配对**：
+之前的安装器里有 bug，会把所有 Apple-VID 的设备实例 `/remove-device`
+（包括 Magic Keyboard 等），导致它们在设备管理器里黄色感叹号。新版本已经
+修复——不再做任何 `/remove-device` 操作。修复已经损坏的设备：
 
-1. **设置 → 蓝牙和设备**，点鼠标后面的 `…` 菜单 → **删除设备**
-2. **添加设备 → 蓝牙**，重新配对鼠标
-3. 右键托盘 → **Reconnect**，托盘提示应变为"connected"
+1. 在设备管理器中，找到带感叹号的蓝牙设备，右键 → **卸载设备**（如果有
+   "删除该设备的驱动程序软件"的勾选框，**不要勾**）
+2. **设置 → 蓝牙和设备**，把对应的设备删了
+3. **添加设备 → 蓝牙**，重新配对一次
 
-USB 线连接的话，拔了再插也能达到同样效果。重启 Windows 也行。
+或者最直接的办法：**重启 Windows**，绝大多数情况蓝牙堆栈会自动恢复。
+
+### 安装器是怎么工作的
+
+它**绝对不会**乱删或者重扫无关设备，只做两件事：
+
+1. `pnputil /add-driver MagicMouse.inf /install` —— 把 INF 注册到 Windows 的
+   驱动库（driver store）。
+2. 对每一个已知的 Magic Mouse hardware ID 调用一次
+   `UpdateDriverForPlugAndPlayDevicesW(...)` —— 这是 Windows 提供的精确按
+   PID 替换驱动的 API。其他 Apple 设备（Magic Keyboard、AirPods 等）的 PID
+   不在我们的白名单里，**绝对不会被碰到**。
 
 ---
 
