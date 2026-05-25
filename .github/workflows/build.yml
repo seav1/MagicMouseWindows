@@ -24,8 +24,26 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore src/MagicMouseApp/MagicMouseApp.csproj
 
-      - name: Build
-        run: dotnet publish src/MagicMouseApp/MagicMouseApp.csproj -c Release -r win-x64 --self-contained true -o publish
+      - name: Publish (single-file, self-contained, win-x64)
+        run: >
+          dotnet publish src/MagicMouseApp/MagicMouseApp.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:PublishReadyToRun=false
+          -o publish
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "publish/MagicMouseApp.exe")) {
+            Write-Error "MagicMouseApp.exe was not produced"
+            exit 1
+          }
+          Get-Item "publish/MagicMouseApp.exe" | Format-List FullName,Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -41,10 +59,12 @@ jobs:
           body: |
             ## Magic Mouse Windows ${{ github.ref_name }}
 
+            Compatible with **Windows 10 (1607+) and Windows 11**, x64.
+
             ### Installation
             See [README](https://github.com/seav1/MagicMouseWindows#-quick-start) for full setup instructions.
 
             ### Download
-            Download `MagicMouseApp.exe` below and run it directly — no installation needed.
+            Download `MagicMouseApp.exe` below and run it directly - no installation needed.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
