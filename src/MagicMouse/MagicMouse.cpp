@@ -20,9 +20,15 @@
 // Resulting exe is ~6.5 MB (driver embedded), runs on Windows 8.1 / 10 / 11.
 // ============================================================================
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -91,7 +97,6 @@ static HANDLE           g_thread = NULL;
 static volatile LONG    g_running = 0;
 static int              g_accX = 0, g_accY = 0;
 static wchar_t          g_lastOpenPath[MAX_PATH] = L"";
-static BOOL             g_offeredInstall = FALSE;
 
 // ===========================================================================
 // Settings persistence
@@ -388,53 +393,23 @@ static void DeleteFolderRecursive(const wchar_t* dir)
     RemoveDirectoryW(dir);
 }
 
-// Run a console process synchronously, return exit code; capture combined output.
-static DWORD RunCapture(const wchar_t* cmdline, wchar_t* outBuf, size_t outCch)
+// Run a console process synchronously, hidden, return exit code only.
+// We deliberately do NOT capture stdout: modern pnputil emits UTF-16 LE
+// with a BOM on some locales while reverting to OEM/ACP on others, which
+// makes pretty-printing a moving target. The exit code is enough.
+static DWORD RunWait(const wchar_t* cmdline)
 {
-    if (outBuf && outCch) outBuf[0] = 0;
-
-    SECURITY_ATTRIBUTES sa = { sizeof(sa) };
-    sa.bInheritHandle = TRUE;
-    HANDLE rd = NULL, wr = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return (DWORD)-1;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
     STARTUPINFOW si = { sizeof(si) };
-    si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    si.hStdOutput = wr;
-    si.hStdError  = wr;
-    si.hStdInput  = NULL;
     PROCESS_INFORMATION pi = { 0 };
 
     wchar_t mut[1024];
     StringCchCopyW(mut, 1024, cmdline);
-    if (!CreateProcessW(NULL, mut, NULL, NULL, TRUE,
+    if (!CreateProcessW(NULL, mut, NULL, NULL, FALSE,
             CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(rd); CloseHandle(wr);
         return (DWORD)-1;
     }
-    CloseHandle(wr);
-
-    char  rbuf[4096];
-    DWORD got;
-    size_t outLen = outBuf ? wcslen(outBuf) : 0;
-    while (ReadFile(rd, rbuf, sizeof(rbuf) - 1, &got, NULL) && got) {
-        rbuf[got] = 0;
-        if (outBuf && outCch) {
-            wchar_t wbuf[4096];
-            int wn = MultiByteToWideChar(CP_ACP, 0, rbuf, (int)got, wbuf, _countof(wbuf) - 1);
-            if (wn > 0) {
-                wbuf[wn] = 0;
-                if (outLen + wn + 1 < outCch) {
-                    StringCchCatW(outBuf, outCch, wbuf);
-                    outLen += wn;
-                }
-            }
-        }
-    }
-    CloseHandle(rd);
-
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -443,41 +418,43 @@ static DWORD RunCapture(const wchar_t* cmdline, wchar_t* outBuf, size_t outCch)
     return exitCode;
 }
 
-// ELEVATED entry point: extract -> add-driver -> remove Apple devices ->
-// scan-devices. Run from RunAsAdminAndInstall via "--install-driver" flag.
+// Returns TRUE if the named kernel service is registered with the SCM.
+// We use this to distinguish "INF was never installed" (->offer install)
+// from "INF is in driver store but mouse isn't connected" (->just wait).
+static BOOL IsServiceInstalled(const wchar_t* name)
+{
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return FALSE;
+    SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+    BOOL found = (svc != NULL);
+    if (svc) CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return found;
+}
+
+// ELEVATED entry point: extract embedded driver, add to store, force PnP
+// to re-evaluate any Apple devices already enumerated, then verify.
 static int RunDriverInstallElevated(void)
 {
-    wchar_t log[16384];
-    StringCchCopyW(log, _countof(log),
-        L"=== Magic Mouse driver install log ===\r\n\r\n");
-
     wchar_t dir[MAX_PATH];
     if (!ExtractDriversToTemp(dir, MAX_PATH)) {
         MessageBoxW(NULL,
-            L"Failed to extract embedded driver files.",
+            L"Failed to extract the embedded driver files to %TEMP%.\r\n"
+            L"Free some disk space and try again.",
             L"Magic Mouse - Install error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    StringCchCatW(log, _countof(log), L"Extracted to: ");
-    StringCchCatW(log, _countof(log), dir);
-    StringCchCatW(log, _countof(log), L"\r\n\r\n");
-
-    // 1) pnputil /add-driver <inf> /install
+    // 1) pnputil /add-driver <inf> /install  - registers the INF and binds
+    //    it to any matching device that is currently UN-driven.
     wchar_t cmd[1024];
     StringCchPrintfW(cmd, 1024,
         L"pnputil.exe /add-driver \"%s\\MagicMouse.inf\" /install", dir);
-    StringCchCatW(log, _countof(log), L"[1/3] Adding driver to driver store...\r\n");
-    StringCchCatW(log, _countof(log), cmd);
-    StringCchCatW(log, _countof(log), L"\r\n");
-    DWORD rc = RunCapture(cmd, log, _countof(log));
-    wchar_t line[64];
-    StringCchPrintfW(line, 64, L"[exit %lu]\r\n\r\n", rc);
-    StringCchCatW(log, _countof(log), line);
+    DWORD rcAdd = RunWait(cmd);
 
-    // 2) Find every Apple device + remove its instance so PnP re-evaluates
-    StringCchCatW(log, _countof(log), L"[2/3] Re-binding existing Apple devices...\r\n");
-
+    // 2) Force-rebind: for every Apple-VID device currently bound to a
+    //    different driver, remove the instance so PnP re-picks one.
+    int removed = 0;
     HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL,
         DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (ds != INVALID_HANDLE_VALUE) {
@@ -485,8 +462,8 @@ static int RunDriverInstallElevated(void)
         BYTE hwbuf[2048];
         for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
             DWORD got = 0;
-            if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL,
-                    hwbuf, sizeof(hwbuf), &got) || got < 4)
+            if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID,
+                    NULL, hwbuf, sizeof(hwbuf), &got) || got < 4)
                 continue;
             if (!HwidLooksApple((wchar_t*)hwbuf, got / sizeof(wchar_t)))
                 continue;
@@ -495,53 +472,68 @@ static int RunDriverInstallElevated(void)
             if (!SetupDiGetDeviceInstanceIdW(ds, &d, instId, _countof(instId), NULL))
                 continue;
 
-            StringCchPrintfW(cmd, 1024, L"pnputil.exe /remove-device \"%s\"", instId);
-            StringCchCatW(log, _countof(log), L"  removing ");
-            StringCchCatW(log, _countof(log), instId);
-            StringCchCatW(log, _countof(log), L"\r\n");
-            RunCapture(cmd, log, _countof(log));
+            StringCchPrintfW(cmd, 1024,
+                L"pnputil.exe /remove-device \"%s\"", instId);
+            if (RunWait(cmd) == 0) removed++;
         }
         SetupDiDestroyDeviceInfoList(ds);
     }
-    StringCchCatW(log, _countof(log), L"\r\n");
 
-    // 3) Trigger bus rescan so PnP picks our newly-added INF
-    StringCchCatW(log, _countof(log), L"[3/3] Rescanning bus...\r\n");
-    StringCchCopyW(cmd, 1024, L"pnputil.exe /scan-devices");
-    rc = RunCapture(cmd, log, _countof(log));
-    StringCchPrintfW(line, 64, L"[exit %lu]\r\n", rc);
-    StringCchCatW(log, _countof(log), line);
+    // 3) Bus rescan: resurrect the just-removed instances under the new INF.
+    RunWait(L"pnputil.exe /scan-devices");
+    Sleep(2000);
 
-    Sleep(1500);
-
-    // Check final state
+    // Verify
     int bound = 0;
     HANDLE check = OpenMagicMouse(&bound);
     if (check) CloseHandle(check);
-
-    StringCchCatW(log, _countof(log), L"\r\n----\r\n");
-    StringCchPrintfW(line, 64, L"Devices now bound to MagicMouse: %d\r\n", bound);
-    StringCchCatW(log, _countof(log), line);
+    BOOL serviceOk = IsServiceInstalled(L"MagicMouse");
 
     DeleteFolderRecursive(dir);
 
     if (bound > 0) {
         MessageBoxW(NULL,
             L"Driver installed and bound to your Magic Mouse.\r\n"
-            L"You can close this dialog; the app will resume automatically.",
+            L"Close this dialog; the tray app will resume automatically.",
             L"Magic Mouse - Install OK", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
 
-    StringCchCatW(log, _countof(log),
-        L"\r\nNo Apple device is bound to MagicMouse yet.\r\n"
-        L"Possible reasons:\r\n"
-        L"  - Mouse isn't paired/turned on - pair it via Settings -> Bluetooth\r\n"
-        L"    and run this installer again from the tray menu.\r\n"
-        L"  - Driver INF doesn't list your specific HardwareID (rare).\r\n");
-    MessageBoxW(NULL, log, L"Magic Mouse - Install result",
-        MB_OK | MB_ICONWARNING);
-    return 2;
+    if (!serviceOk) {
+        wchar_t msg[512];
+        StringCchPrintfW(msg, _countof(msg),
+            L"Failed to register the driver with Windows.\r\n\r\n"
+            L"pnputil exit code: %lu\r\n\r\n"
+            L"Make sure you accepted the UAC prompt and that no other Magic\r\n"
+            L"Mouse driver (e.g. Magic Utilities) is currently installed.",
+            rcAdd);
+        MessageBoxW(NULL, msg, L"Magic Mouse - Install error",
+            MB_OK | MB_ICONERROR);
+        return 2;
+    }
+
+    // Driver is in the store but no device is currently bound to it.
+    // The most common cause is a paired-but-bound-to-Microsoft-HID Bluetooth
+    // mouse: PnP won't auto-switch drivers for an already-known BT device
+    // until the device is unpaired and re-paired.
+    wchar_t msg[1024];
+    StringCchPrintfW(msg, _countof(msg),
+        L"The Magic Mouse driver is now installed in Windows, but no\r\n"
+        L"Magic Mouse is bound to it yet (instances re-scanned: %d).\r\n\r\n"
+        L"How to finish:\r\n\r\n"
+        L"   1.  Open  Settings -> Bluetooth & devices.\r\n"
+        L"   2.  Find your Magic Mouse, click the [...] menu, choose\r\n"
+        L"       \"Remove device\" / \"Forget\".\r\n"
+        L"   3.  Click \"Add device\" -> \"Bluetooth\" and pair the mouse\r\n"
+        L"       again.\r\n"
+        L"   4.  Click \"Reconnect\" in the tray menu.\r\n\r\n"
+        L"(If the mouse is plugged in via USB / USB-C cable, just unplug\r\n"
+        L"and re-plug it instead. A reboot also works.)",
+        removed);
+    MessageBoxW(NULL, msg,
+        L"Magic Mouse - Driver added, please re-pair the mouse",
+        MB_OK | MB_ICONINFORMATION);
+    return 0;
 }
 
 // ===========================================================================
@@ -601,35 +593,44 @@ static void OfferDriverInstall(BOOL forceAsk)
 {
     int boundCount = 0;
     HANDLE h = OpenMagicMouse(&boundCount);
-    if (h) { CloseHandle(h); }
-    int appleCount = CountAppleDevices();
+    if (h) CloseHandle(h);
+    int  appleCount = CountAppleDevices();
+    BOOL serviceOk  = IsServiceInstalled(L"MagicMouse");
 
-    // Decide whether to prompt
     const wchar_t* msg = NULL;
     if (boundCount > 0) {
-        if (!forceAsk) return;  // already bound, nothing to do unless user asked
-        msg = L"The driver appears to be installed and bound. Reinstall it anyway?";
+        if (!forceAsk) return;
+        msg = L"The driver is installed and your Magic Mouse is bound to it.\r\n"
+              L"Reinstall it anyway?";
+    } else if (!serviceOk) {
+        // Real first run - INF was never registered.
+        msg = L"The Magic Mouse driver isn't installed on this PC yet.\r\n\r\n"
+              L"Install the bundled driver now?\r\n"
+              L"Windows will ask for administrator approval once.";
     } else if (appleCount == 0) {
-        if (!forceAsk) return;  // mouse simply isn't paired/on
-        msg = L"No Apple device detected in PnP yet.\r\n"
-              L"Make sure the mouse is paired via Bluetooth, then proceed?";
+        // Driver is in the store but no Apple device is paired/connected.
+        // Don't nag on every launch - only ask if the user explicitly chose
+        // \"Reinstall driver...\".
+        if (!forceAsk) return;
+        msg = L"The driver is already installed, but no Magic Mouse is\r\n"
+              L"currently paired/connected. Pair the mouse first, then click\r\n"
+              L"\"Reconnect\" in the tray menu.\r\n\r\n"
+              L"Run the installer anyway?";
     } else {
-        msg = L"The Magic Mouse driver isn't bound to your mouse.\r\n\r\n"
-              L"Install/rebind the embedded driver now?\r\n"
-              L"(Windows will ask for administrator approval.)";
+        // Driver in store, Apple device present, but not bound. Common case
+        // when Windows preferred its built-in HID stack.
+        msg = L"The driver is installed but not bound to your Magic Mouse.\r\n\r\n"
+              L"Try to fix it now?\r\n"
+              L"Windows will ask for administrator approval once.";
     }
 
     int r = MessageBoxW(NULL, msg, L"Magic Mouse - Driver setup",
         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
     if (r != IDYES) return;
 
-    if (IsRunningAsAdmin()) {
-        RunDriverInstallElevated();
-    } else {
-        RelaunchInstallerElevated();
-    }
+    if (IsRunningAsAdmin()) RunDriverInstallElevated();
+    else                    RelaunchInstallerElevated();
 
-    // Try to reconnect after install
     StartReader();
     UpdateTrayTip();
 }
@@ -757,10 +758,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (wp == 1) {
                 if (StartReader()) KillTimer(hwnd, 1);
                 UpdateTrayTip();
-                if (!g_dev && !g_offeredInstall && CountAppleDevices() > 0) {
-                    g_offeredInstall = TRUE;
-                    OfferDriverInstall(FALSE);
-                }
+                // Don't pop install prompts from the timer - if the user
+                // dismissed it once we won't keep asking. Use the
+                // "Reinstall driver..." menu item to retry on demand.
             }
             return 0;
 
@@ -813,11 +813,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE prev, LPWSTR cmdLine, int show)
     StringCchCopyW(g_nid.szTip, _countof(g_nid.szTip), L"Magic Mouse");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-    // Try to connect immediately. If it fails and an Apple device is present,
-    // offer to install the embedded driver.
+    // Try to connect immediately. If we can't, only offer the install
+    // dialog when the kernel service genuinely isn't registered (= true
+    // first run). Otherwise just spin on the reconnect timer; the user
+    // can still kick off "Reinstall driver..." manually from the tray.
     if (!StartReader()) {
-        if (CountAppleDevices() > 0) {
-            g_offeredInstall = TRUE;
+        if (!IsServiceInstalled(L"MagicMouse")) {
             OfferDriverInstall(FALSE);
         }
         SetTimer(g_hwnd, 1, 3000, NULL);

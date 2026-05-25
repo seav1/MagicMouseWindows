@@ -28,6 +28,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem --- sanity: make sure the embedded driver files are present ----------------
+for %%F in (drivers\MagicMouse.inf drivers\MagicMouse.sys drivers\MagicMouse.cat) do (
+  if not exist "%%F" (
+    echo [build.cmd] ERROR: required file is missing: %%F
+    echo            The driver files must be committed/uploaded alongside the
+    echo            source. Make sure "src\MagicMouse\drivers\" contains
+    echo            MagicMouse.inf, MagicMouse.sys and MagicMouse.cat.
+    exit /b 1
+  )
+)
+
 if not exist build mkdir build
 
 echo [build.cmd] Compiling resource (embeds driver files)...
