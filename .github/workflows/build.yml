@@ -16,55 +16,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          dotnet-version: '6.0.x'
+          arch: x64
 
-      - name: Restore dependencies
-        run: dotnet restore src/MagicMouseApp/MagicMouseApp.csproj
-
-      - name: Publish (single-file, self-contained, win-x64)
-        run: >
-          dotnet publish src/MagicMouseApp/MagicMouseApp.csproj
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:EnableCompressionInSingleFile=true
-          -p:PublishReadyToRun=false
-          -o publish
+      - name: Compile MagicMouse.exe
+        shell: cmd
+        working-directory: src\MagicMouse
+        run: |
+          if not exist build mkdir build
+          rc /nologo /fo build\MagicMouse.res MagicMouse.rc
+          cl /nologo /O2 /MT /EHsc /W3 /GS- ^
+             /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DWIN32_LEAN_AND_MEAN ^
+             /Fe:build\MagicMouse.exe /Fo:build\ ^
+             MagicMouse.cpp build\MagicMouse.res ^
+             /link /SUBSYSTEM:WINDOWS ^
+             setupapi.lib user32.lib shell32.lib advapi32.lib gdi32.lib ole32.lib kernel32.lib
 
       - name: Verify artifact
         shell: pwsh
         run: |
-          if (-not (Test-Path "publish/MagicMouseApp.exe")) {
-            Write-Error "MagicMouseApp.exe was not produced"
+          $exe = "src/MagicMouse/build/MagicMouse.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "MagicMouse.exe was not produced"
             exit 1
           }
-          Get-Item "publish/MagicMouseApp.exe" | Format-List FullName,Length
+          Get-Item $exe | Format-List FullName, Length, VersionInfo
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MagicMouseApp
-          path: publish/MagicMouseApp.exe
+          name: MagicMouse
+          path: src/MagicMouse/build/MagicMouse.exe
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: publish/MagicMouseApp.exe
+          files: src/MagicMouse/build/MagicMouse.exe
           body: |
             ## Magic Mouse Windows ${{ github.ref_name }}
 
-            Compatible with **Windows 10 (1607+) and Windows 11**, x64.
+            Native Win32 build (no .NET runtime required).
+
+            **Compatible with**: Windows 10 (1607+) and Windows 11, x64.
+            **Size**: ~150 KB single .exe.
 
             ### Installation
             See [README](https://github.com/seav1/MagicMouseWindows#-quick-start) for full setup instructions.
 
             ### Download
-            Download `MagicMouseApp.exe` below and run it directly - no installation needed.
+            Download `MagicMouse.exe` below and run it directly - no installation needed.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
