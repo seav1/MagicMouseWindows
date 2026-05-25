@@ -44,16 +44,29 @@ That's it. No external driver download, no Device Manager, no PowerShell.
 
 ## Troubleshooting
 
-| Symptom | Try |
+| Symptom | Fix |
 |---|---|
-| Tray says "not connected" | Mouse paired & on? Click **Reconnect**. |
+| Tray says "not connected" | Mouse paired and powered on? Click **Reconnect**. |
 | First-run UAC dialog rejected | Right-click tray → **Reinstall driver…** |
-| Mouse pointer moves but no scroll | **Reinstall driver…** then unpair / re-pair the mouse. |
-| Worked yesterday, dead today after Windows Update | **Reinstall driver…** (Windows sometimes prefers its built-in HID driver). |
-| Multiple Magic Mice | Only the first device whose service is `MagicMouse` is opened. |
+| Pointer moves but no scrolling | **Reinstall driver…**, then in Windows **Settings → Bluetooth & devices** click the mouse's `…` menu → **Remove device**, then pair it again. Windows only switches drivers for an already-paired BT device after a re-pair. |
+| Worked yesterday, dead today after Windows Update | Same as above — Windows sometimes promotes its built-in HID driver after updates. |
+| Multiple Magic Mice connected | Only the first device whose service is `MagicMouse` is opened. |
 
 If you'd rather use the official paid app, uninstall this and grab
 [Magic Utilities](https://magicutilities.net/).
+
+### "Driver added, but no Magic Mouse is bound"
+
+The bundled installer runs `pnputil /add-driver /install` and then
+removes + re-scans every Apple-VID device it sees. For a Bluetooth mouse,
+Windows still won't switch from `hidbth` to `MagicMouse` until the device
+is **unpaired and re-paired**. Steps:
+
+1. **Settings → Bluetooth & devices**, click the `…` next to your Magic
+   Mouse and choose **Remove device**.
+2. **Add device → Bluetooth**, pair the mouse again.
+3. Right-click the tray icon → **Reconnect**. Tray should switch to
+   *"connected"*.
 
 ---
 

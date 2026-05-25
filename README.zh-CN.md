@@ -43,14 +43,26 @@
 
 | 现象 | 处理 |
 |---|---|
-| 托盘显示"未连接" | 检查鼠标是否已配对并打开，点 **Reconnect** |
+| 托盘显示"未连接" | 鼠标是否已配对并打开？点 **Reconnect** |
 | 首次 UAC 点了"否" | 右键托盘 → **Reinstall driver…** |
-| 指针能动，就是滚不动 | **Reinstall driver…**，必要时把鼠标取消配对再配对一次 |
-| 昨天还行，今天 Windows 更新后挂了 | **Reinstall driver…**（Windows 有时会把驱动切回自带 HID） |
+| 指针能动，就是滚不动 | 见下面"驱动装上但鼠标没绑定"那一节 |
+| 昨天还行，今天 Windows 更新后挂了 | 跟上面一样，Windows 偶尔会把驱动切回自带 HID |
 | 同时连了多个 Magic Mouse | 只会打开第一个绑定到 `MagicMouse` 服务的设备 |
 
 如果你想直接用官方付费版，请卸载本程序后到
 [Magic Utilities](https://magicutilities.net/) 下载安装。
+
+### "驱动装上了，但鼠标没绑定"
+
+程序会跑 `pnputil /add-driver /install`，再把已枚举的 Apple-VID 设备
+逐个 `/remove-device` + `/scan-devices`。但对**已经配过对**的蓝牙鼠标，
+Windows 不会从 `hidbth` 切到 `MagicMouse`，必须**手动取消配对再配对**：
+
+1. **设置 → 蓝牙和设备**，点鼠标后面的 `…` 菜单 → **删除设备**
+2. **添加设备 → 蓝牙**，重新配对鼠标
+3. 右键托盘 → **Reconnect**，托盘提示应变为"connected"
+
+USB 线连接的话，拔了再插也能达到同样效果。重启 Windows 也行。
 
 ---
 
