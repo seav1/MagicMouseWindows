@@ -2,18 +2,48 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
+
+    <!--
+      net6.0-windows runs on Windows 10 1607+ and Windows 11 (and Server 2012 R2+).
+      We deliberately leave SupportedOSPlatformVersion at the SDK default so the
+      binary stays compatible with the broadest range of Windows 10 builds.
+    -->
     <TargetFramework>net6.0-windows</TargetFramework>
+
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <ApplicationIcon></ApplicationIcon>
     <AssemblyName>MagicMouseApp</AssemblyName>
     <RootNamespace>MagicMouseApp</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- App manifest declaring Win10/Win11 supportedOS + DPI awareness -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- Single-file self-contained publish (one .exe, no extra files) -->
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <PublishReadyToRun>true</PublishReadyToRun>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+    <!--
+      ReadyToRun (AOT-precompiled IL) speeds up startup, but it makes the
+      binary larger and only matches the build host's CPU. We disable it by
+      default so a single artifact runs identically on Win10 and Win11
+      across Intel/AMD CPUs without odd JIT-shape regressions.
+    -->
+    <PublishReadyToRun>false</PublishReadyToRun>
+
+    <!-- Trim is OFF: WinForms + reflection-based JsonSerializer are not trim-safe. -->
+    <PublishTrimmed>false</PublishTrimmed>
+
+    <Version>1.1.0</Version>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <Product>Magic Mouse for Windows</Product>
+    <Company>Magic Mouse Windows</Company>
+    <Copyright>MIT License</Copyright>
   </PropertyGroup>
 
 </Project>
