@@ -13,11 +13,13 @@
 
 #include <windows.h>
 #include <setupapi.h>
+#include <hidsdi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <strsafe.h>
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "hid.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -198,54 +200,64 @@ static void CandidateListSort(CandidateList* list)
 static void RebuildCandidates(CandidateList* out)
 {
     ZeroMemory(out, sizeof(*out));
-    HDEVINFO ds = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO ds = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (ds == INVALID_HANDLE_VALUE) return;
 
-    SP_DEVINFO_DATA d = { sizeof(d) };
-    BYTE hwbuf[4096];
-    BYTE svcbuf[512];
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(ds, i, &d); i++) {
-        wchar_t pdo[260] = L"";
-        if (!SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_PHYSICAL_DEVICE_OBJECT_NAME, NULL,
-                (BYTE*)pdo, sizeof(pdo), NULL) || !pdo[0]) {
+    for (DWORD i = 0;; i++) {
+        SP_DEVICE_INTERFACE_DATA ifc = { 0 };
+        ifc.cbSize = sizeof(ifc);
+        if (!SetupDiEnumDeviceInterfaces(ds, NULL, &hidGuid, i, &ifc)) {
+            if (GetLastError() == ERROR_NO_MORE_ITEMS) break;
             continue;
         }
-        wchar_t path[320];
-        StringCchPrintfW(path, _countof(path), L"\\\\.\\GLOBALROOT%s", pdo);
+
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(ds, &ifc, NULL, 0, &need, NULL);
+        if (need < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) continue;
+
+        BYTE* detailBuf = (BYTE*)LocalAlloc(LPTR, need);
+        if (!detailBuf) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)detailBuf;
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        SP_DEVINFO_DATA devInfo = { 0 };
+        devInfo.cbSize = sizeof(devInfo);
+
+        if (!SetupDiGetDeviceInterfaceDetailW(ds, &ifc, detail, need, NULL, &devInfo)) {
+            LocalFree(detailBuf);
+            continue;
+        }
+
+        const wchar_t* path = detail->DevicePath;
+        if (!path || !*path) {
+            LocalFree(detailBuf);
+            continue;
+        }
+
+        // Only keep Magic Mouse VID/PID interfaces.
+        if (!IsMagicMouseHwid(path)) {
+            LocalFree(detailBuf);
+            continue;
+        }
 
         wchar_t svc[128] = L"";
+        BYTE svcBuf[512];
         DWORD got = 0;
-        if (SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_SERVICE, NULL, svcbuf, sizeof(svcbuf), &got) &&
-                got >= sizeof(wchar_t) * 2) {
-            StringCchCopyW(svc, _countof(svc), (const wchar_t*)svcbuf);
+        if (SetupDiGetDeviceRegistryPropertyW(ds, &devInfo, SPDRP_SERVICE, NULL,
+                svcBuf, sizeof(svcBuf), &got) && got >= sizeof(wchar_t) * 2) {
+            StringCchCopyW(svc, _countof(svc), (const wchar_t*)svcBuf);
         }
 
-        int base = 0;
-        if (_wcsicmp(svc, L"MagicMouse") == 0) base += 1000;
-        if (ContainsI(svc, L"HidBth")) base += 60;
-        if (ContainsI(svc, L"mouhid")) base -= 30;
+        int score = 200;
+        if (ContainsI(path, L"COL03")) score += 300;
+        else if (ContainsI(path, L"COL02")) score += 120;
+        else if (ContainsI(path, L"COL01")) score += 20;
+        if (ContainsI(svc, L"HidBth")) score += 80;
+        if (ContainsI(svc, L"mouhid")) score -= 30;
 
-        got = 0;
-        if (SetupDiGetDeviceRegistryPropertyW(ds, &d, SPDRP_HARDWAREID, NULL, hwbuf, sizeof(hwbuf), &got) &&
-                got >= sizeof(wchar_t) * 2) {
-            const wchar_t* p = (const wchar_t*)hwbuf;
-            DWORD remain = got / sizeof(wchar_t);
-            while (remain > 0 && *p) {
-                size_t len = wcslen(p);
-                if (IsMagicMouseHwid(p)) {
-                    int score = base + 200;
-                    if (ContainsI(p, L"COL03")) score += 300;
-                    else if (ContainsI(p, L"COL02")) score += 120;
-                    else if (ContainsI(p, L"COL01")) score += 20;
-                    CandidateListAdd(out, path, p, svc, score);
-                }
-                if (len + 1 > remain) break;
-                p += len + 1;
-                remain -= (DWORD)(len + 1);
-            }
-        } else if (_wcsicmp(svc, L"MagicMouse") == 0) {
-            CandidateListAdd(out, path, L"", svc, base + 500);
-        }
+        CandidateListAdd(out, path, path, svc, score);
+        LocalFree(detailBuf);
     }
 
     SetupDiDestroyDeviceInfoList(ds);
