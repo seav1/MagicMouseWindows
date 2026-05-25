@@ -205,15 +205,25 @@ namespace MagicMouseApp
         {
             try
             {
-                var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true);
+                // In single-file publish mode (PublishSingleFile=true) Assembly.Location
+                // returns an empty string, so we MUST use Environment.ProcessPath
+                // (available .NET 6+) which always points to the real .exe on disk.
+                string exePath = Environment.ProcessPath
+                    ?? System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
+                    ?? string.Empty;
+
+                if (string.IsNullOrEmpty(exePath)) return;
+
+                using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", writable: true);
+                if (key == null) return;
+
                 if (enable)
-                    key?.SetValue("MagicMouseApp",
-                        $"\"{System.Reflection.Assembly.GetExecutingAssembly().Location}\"");
+                    key.SetValue("MagicMouseApp", $"\"{exePath}\"");
                 else
-                    key?.DeleteValue("MagicMouseApp", false);
+                    key.DeleteValue("MagicMouseApp", throwOnMissingValue: false);
             }
-            catch { }
+            catch { /* registry may be locked down on managed devices - ignore */ }
         }
 
         public void UpdateStatus(string status)
