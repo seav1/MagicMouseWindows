@@ -106,10 +106,11 @@ static volatile LONG g_running = 0;
 static int g_accX = 0;
 static int g_accY = 0;
 static wchar_t g_lastOpenPath[MAX_PATH] = L"";
+static wchar_t g_lastOpenDetail[4096] = L"";
 
 static BOOL IsServiceInstalled(const wchar_t* name);
 static AppState QueryState(int* outCandidates, int* outBound);
-static HANDLE TryOpenPath(const wchar_t* path);
+static HANDLE TryOpenPath(const wchar_t* path, DWORD* outErr);
 
 static BOOL ContainsI(const wchar_t* hay, const wchar_t* needle)
 {
@@ -197,10 +198,16 @@ static HANDLE OpenByMagicMouseService(int* outServiceCount)
         }
         wchar_t full[320];
         StringCchPrintfW(full, _countof(full), L"\\\\.\\GLOBALROOT%s", pdo);
-        HANDLE h = TryOpenPath(full);
+        DWORD err = 0;
+        HANDLE h = TryOpenPath(full, &err);
         if (h) {
             StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), full);
+            StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+                L"service open ok: %s", full);
             opened = h;
+        } else if (!g_lastOpenDetail[0]) {
+            StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+                L"service open failed: %s (err=%lu)", full, err);
         }
     }
     SetupDiDestroyDeviceInfoList(ds);
@@ -258,14 +265,21 @@ static int CollectCandidates(MouseCandidate* out, int cap)
     return count;
 }
 
-static HANDLE TryOpenPath(const wchar_t* path)
+static HANDLE TryOpenPath(const wchar_t* path, DWORD* outErr)
 {
+    if (outErr) *outErr = ERROR_SUCCESS;
     HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) {
+        DWORD e1 = GetLastError();
         h = CreateFileW(path, GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE && outErr) {
+            DWORD e2 = GetLastError();
+            *outErr = e2 ? e2 : e1;
+        }
     }
+    if (h != INVALID_HANDLE_VALUE && outErr) *outErr = ERROR_SUCCESS;
     return (h == INVALID_HANDLE_VALUE) ? NULL : h;
 }
 
@@ -274,6 +288,7 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
     if (outBoundCount) *outBoundCount = 0;
     if (outCandidateCount) *outCandidateCount = 0;
     g_lastOpenPath[0] = 0;
+    g_lastOpenDetail[0] = 0;
 
     // Pass 0 (primary): direct service scan. This is the most reliable path.
     int svcCount = 0;
@@ -295,10 +310,16 @@ static HANDLE OpenMagicMouse(int* outBoundCount, int* outCandidateCount)
     // Pass 1: prefer bound devices.
     for (int i = 0; i < n; i++) {
         if (!arr[i].isBound || !arr[i].hasPdo) continue;
-        HANDLE h = TryOpenPath(arr[i].pdoPath);
+        DWORD err = 0;
+        HANDLE h = TryOpenPath(arr[i].pdoPath, &err);
         if (h) {
             StringCchCopyW(g_lastOpenPath, _countof(g_lastOpenPath), arr[i].pdoPath);
+            StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+                L"candidate[%d] open ok: %s", i, arr[i].pdoPath);
             return h;
+        } else if (!g_lastOpenDetail[0]) {
+            StringCchPrintfW(g_lastOpenDetail, _countof(g_lastOpenDetail),
+                L"candidate[%d] open failed: %s (err=%lu)", i, arr[i].pdoPath, err);
         }
     }
 
@@ -755,10 +776,40 @@ static void ShowStatus(void)
     else if (st == ST_NOT_PAIRED) stateText = L"not paired";
     else if (st == ST_DRIVER_MISSING) stateText = L"driver missing";
 
-    wchar_t msg[1024];
+    MouseCandidate arr[MAX_CANDIDATES];
+    int n = CollectCandidates(arr, MAX_CANDIDATES);
+    int lim = n > 6 ? 6 : n;
+    wchar_t top[2800] = L"";
+    for (int i = 0; i < lim; i++) {
+        wchar_t line[480];
+        if (arr[i].hasPdo) {
+            DWORD err = 0;
+            HANDLE h = TryOpenPath(arr[i].pdoPath, &err);
+            if (h) CloseHandle(h);
+            StringCchPrintfW(line, _countof(line),
+                L"[%d] b=%d pdo=1 svc=%s err=%lu hwid=%s\r\n",
+                i, arr[i].isBound ? 1 : 0,
+                arr[i].service[0] ? arr[i].service : L"(none)",
+                err,
+                arr[i].sampleHwid[0] ? arr[i].sampleHwid : L"(none)");
+        } else {
+            StringCchPrintfW(line, _countof(line),
+                L"[%d] b=%d pdo=0 svc=%s hwid=%s\r\n",
+                i, arr[i].isBound ? 1 : 0,
+                arr[i].service[0] ? arr[i].service : L"(none)",
+                arr[i].sampleHwid[0] ? arr[i].sampleHwid : L"(none)");
+        }
+        StringCchCatW(top, _countof(top), line);
+    }
+
+    wchar_t msg[4096];
     StringCchPrintfW(msg, _countof(msg),
-        L"State: %s\r\nCandidates: %d\r\nBound count: %d\r\nLast open path: %s\r\n",
-        stateText, cands, bound, g_lastOpenPath[0] ? g_lastOpenPath : L"(none)");
+        L"State: %s\r\nCandidates: %d\r\nBound count: %d\r\nLast open path: %s\r\n"
+        L"Open detail: %s\r\n\r\nTop candidates:\r\n%s",
+        stateText, cands, bound,
+        g_lastOpenPath[0] ? g_lastOpenPath : L"(none)",
+        g_lastOpenDetail[0] ? g_lastOpenDetail : L"(none)",
+        top[0] ? top : L"(none)");
     MessageBoxW(NULL, msg, L"Magic Mouse - Status", MB_OK | MB_ICONINFORMATION);
 }
 
