@@ -1,33 +1,19 @@
-## .NET
-bin/
-obj/
-*.user
-*.suo
-.vs/
-*.DotSettings.user
-
-## Build outputs
-publish/
-*.exe
-*.dll
-*.pdb
-
-## C++ / MSVC native build
+# Native build output
 build/
+*.exe
 *.obj
 *.res
+*.pdb
 *.ilk
 *.exp
 *.lib
 *.idb
-*.tlog
 
-## OS
+# OS / IDE
 .DS_Store
 Thumbs.db
-
-## Rider
-.idea/
-
-## VS Code
+.vs/
 .vscode/
+.idea/
+*.user
+*.suo
