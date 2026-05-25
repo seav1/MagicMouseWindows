@@ -254,18 +254,24 @@ static void RebuildCandidates(CandidateList* out)
 static HANDLE TryOpenPath(const wchar_t* path, DWORD* outErr)
 {
     if (outErr) *outErr = ERROR_SUCCESS;
-    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        DWORD e1 = GetLastError();
-        h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-        if (h == INVALID_HANDLE_VALUE && outErr) {
-            DWORD e2 = GetLastError();
-            *outErr = e2 ? e2 : e1;
+    DWORD last = ERROR_GEN_FAILURE;
+
+    // Some HID collections deny GENERIC_READ/WRITE (err=5) but allow
+    // metadata/no-access opens; some dislike overlapped. Try a matrix.
+    const DWORD accessModes[] = { GENERIC_READ | GENERIC_WRITE, GENERIC_READ, 0 };
+    const DWORD flagsModes[]  = { FILE_FLAG_OVERLAPPED, 0 };
+
+    for (int f = 0; f < (int)_countof(flagsModes); f++) {
+        for (int a = 0; a < (int)_countof(accessModes); a++) {
+            HANDLE h = CreateFileW(path, accessModes[a], FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL, OPEN_EXISTING, flagsModes[f], NULL);
+            if (h != INVALID_HANDLE_VALUE) return h;
+            DWORD e = GetLastError();
+            if (e) last = e;
         }
     }
-    return (h == INVALID_HANDLE_VALUE) ? NULL : h;
+    if (outErr) *outErr = last;
+    return NULL;
 }
 
 static BOOL OpenNextCandidate(int startIndex)
